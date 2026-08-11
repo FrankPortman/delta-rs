@@ -13,7 +13,11 @@ also saves memory. Finally, some methods allow reading tables
 batch-by-batch, allowing you to process the whole table while only
 having a portion loaded at any given time.
 
-To load into Pandas or a PyArrow table use the `DeltaTable.to_pandas` and `DeltaTable.to_pyarrow_table` methods, respectively. Both of these support filtering partitions and selecting particular columns.
+To load into Pandas or a PyArrow table use the `DeltaTable.to_pandas` and
+`DeltaTable.to_pyarrow_table` methods, respectively. These are the
+engine-native reads: they run through the embedded DataFusion engine, take
+`columns` to project and tuple `filters` to filter rows exactly, and derive
+file pruning from the filters.
 
 ``` python
 >>> from deltalake import DeltaTable
@@ -23,13 +27,13 @@ value: string
 year: string
 month: string
 day: string
->>> dt.to_pandas(file_pruning_predicate=[("year", "=", "2021")], columns=["value"])
+>>> dt.to_pandas(filters=[("year", "=", "2021")], columns=["value"])
       value
 0     6
 1     7
 2     5
 3     4
->>> dt.to_pyarrow_table(file_pruning_predicate="year = 2021", columns=["value"])
+>>> dt.to_pyarrow_table(filters=[("year", "=", "2021")], columns=["value"])
 pyarrow.Table
 value: string
 ```
@@ -43,11 +47,11 @@ groups:
 
 ``` python
 >>> # SQL string
->>> dt.to_pandas(file_pruning_predicate="(year = 2020 AND month = 2) OR (year = 2021 AND month = 12)")
+>>> dt.file_uris(file_pruning_predicate="(year = 2020 AND month = 2) OR (year = 2021 AND month = 12)")
 >>> # flat list of tuples: a single conjunction, year = 2020 AND month = 2
->>> dt.to_pandas(file_pruning_predicate=[("year", "=", "2020"), ("month", "=", "2")])
+>>> dt.file_uris(file_pruning_predicate=[("year", "=", "2020"), ("month", "=", "2")])
 >>> # list of lists: OR across the inner AND groups
->>> dt.to_pandas(
+>>> dt.file_uris(
 ...     file_pruning_predicate=[
 ...         [("year", "=", "2020"), ("month", "=", "2")],
 ...         [("year", "=", "2021"), ("month", "=", "12")],
@@ -55,11 +59,12 @@ groups:
 ... )
 ```
 
-The parameter is accepted everywhere files are selected: `to_pandas`,
-`to_pyarrow_table`, `to_pyarrow_dataset`, `file_uris`, and `partitions`.
-The older `partitions` and `partition_filters` parameters on these methods
-still work but are deprecated in its favor. The predicate may reference any
-column, not just partition columns:
+The parameter belongs to the file-level APIs: `file_uris`, `partitions`, and
+`to_pyarrow_dataset`. On `to_pandas` and `to_pyarrow_table` it still works but
+is deprecated, since tuple `filters` there prune files and filter rows in one
+step. The older `partitions` and `partition_filters` parameters are likewise
+deprecated. The predicate may reference any column, not just partition
+columns:
 
 - **Partition columns** prune exactly: every returned file matches the
   predicate, and only matching files are returned.
@@ -73,21 +78,21 @@ column, not just partition columns:
   [Delta Lake File Skipping](../how-delta-lake-works/delta-lake-file-skipping.md)
   for how to lay out tables so predicates prune well.
 
-As the name says, the predicate prunes files, not rows. Pair it with an
-equivalent `filters=` expression when you need exact rows from a
-non-partition column:
+As the name says, the predicate prunes files, not rows. When you need exact
+rows, pass tuple `filters` to `to_pandas` or `to_pyarrow_table` and let the
+engine derive the pruning:
 
 ``` python
->>> dt.to_pandas(file_pruning_predicate="value >= '5'", filters=[("value", ">=", "5")])
+>>> dt.to_pandas(filters=[("value", ">=", "5")])
 ```
 
 The full syntax for both forms is documented on
 [`DeltaTable.file_uris`](../api/delta_table/index.md).
 
-Converting to a PyArrow Dataset allows you to filter on columns other
-than partition columns and load the result as a stream of batches rather
-than a single table. Convert to a dataset using
-`DeltaTable.to_pyarrow_dataset`. Filters
+`DeltaTable.to_pyarrow_dataset` is the pyarrow interop surface: use it when
+another engine consumes the dataset, or when you need pyarrow-specific
+control such as a custom filesystem, `pyarrow.dataset.Expression` filters, or
+loading the result as a stream of batches rather than a single table. Filters
 applied to datasets will use the partition values and file statistics
 from the Delta transaction log and push down any other filters to the
 scanning operation.

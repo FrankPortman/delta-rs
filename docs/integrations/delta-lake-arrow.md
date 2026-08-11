@@ -8,6 +8,8 @@ This page shows you how to convert Delta tables to Arrow data structures and tea
 
 Delta tables can easily be exposed as Arrow datasets.  This makes it easy for any query engine that can read Arrow datasets to read a Delta table.
 
+`to_pyarrow_dataset` is the pyarrow interop surface: reach for it when another engine consumes the dataset, or when you need pyarrow-specific control such as a custom filesystem or `pyarrow.dataset.Expression` filters.  For reading into pandas or an Arrow table inside Python, `to_pandas` and `to_pyarrow_table` are engine-native reads through the embedded DataFusion engine and do not need a dataset.
+
 Let's take a look at the h2o groupby dataset that contains 9 columns of data.  Here are three representative rows of data:
 
 ```
@@ -58,7 +60,13 @@ quack = duckdb.arrow(table.to_pyarrow_table())
 quack.filter("id1 = 'id016' and v2 > 10")
 ```
 
-This returns the same result, but it runs slower.
+This returns the same result, but it runs slower: the whole table is materialized before DuckDB sees a single row.
+
+When the read itself is the goal, skip the detour through DuckDB and push the projection and row filters into the engine-native read:
+
+```python
+table.to_pyarrow_table(columns=["id1", "v2"], filters=[("id1", "=", "id016"), ("v2", ">", 10)])
+```
 
 ## Difference between Arrow Dataset and Arrow Table
 
