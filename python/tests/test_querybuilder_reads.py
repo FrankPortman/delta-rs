@@ -1,15 +1,10 @@
-"""Reads through the QueryBuilder path of `to_pyarrow_table` and `to_pandas`.
+"""Reads through `to_pyarrow_table` and `to_pandas`.
 
-`to_pyarrow_table` reads through the embedded DataFusion engine when the call
-only projects columns and filters rows with tuple filters; everything else
-scans through a pyarrow dataset as before. These tests pin the equivalence of
-the two paths, the path selection, the deprecation warnings on the fallback
-triggers, and the reader features the DataFusion path unlocks.
+Both methods read through the embedded DataFusion engine: `columns` project
+and tuple `filters` apply to rows exactly. These tests pin the equivalence
+with a pyarrow dataset scan, the rejection of the pyarrow-only arguments the
+methods no longer take, and the reader features the DataFusion path unlocks.
 """
-
-import warnings
-from contextlib import contextmanager
-from pathlib import Path
 
 import pytest
 
@@ -26,32 +21,11 @@ def _rows(table) -> list[dict]:
 
 
 def _dataset_path_table(dt: DeltaTable, columns=None, filters=None):
-    """Read through the pyarrow dataset path directly, bypassing the router."""
+    """Read the same table through a pyarrow dataset scan."""
     from pyarrow.parquet import filters_to_expression
 
     expression = filters_to_expression(filters) if filters is not None else None
     return dt.to_pyarrow_dataset().to_table(columns=columns, filter=expression)
-
-
-@contextmanager
-def _no_deprecations():
-    """Fail the enclosed block if it emits a DeprecationWarning."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", DeprecationWarning)
-        yield
-
-
-def _spy_dataset_path(monkeypatch) -> list:
-    """Record every call that reaches `to_pyarrow_dataset`."""
-    calls = []
-    original = DeltaTable.to_pyarrow_dataset
-
-    def wrapper(self, *args, **kwargs):
-        calls.append(1)
-        return original(self, *args, **kwargs)
-
-    monkeypatch.setattr(DeltaTable, "to_pyarrow_dataset", wrapper)
-    return calls
 
 
 def test_read_query_rendering():
@@ -110,106 +84,47 @@ def test_to_pandas_matches_pyarrow_path():
 
 
 @pytest.mark.pyarrow
-def test_expression_filters_fall_back_to_dataset(monkeypatch):
+def test_expression_filters_rejected():
     import pyarrow.dataset as ds
 
-    calls = _spy_dataset_path(monkeypatch)
     dt = DeltaTable(PARTITIONED_TABLE)
-
-    tuple_result = dt.to_pyarrow_table(filters=[("year", "=", "2021")])
-    assert not calls
-
-    with pytest.warns(DeprecationWarning, match="pyarrow Expression"):
-        expr_result = dt.to_pyarrow_table(filters=ds.field("year") == "2021")
-    assert len(calls) == 1
-    assert _rows(expr_result) == _rows(tuple_result)
+    with pytest.raises(TypeError, match="to_pyarrow_dataset"):
+        dt.to_pyarrow_table(filters=ds.field("year") == "2021")
+    with pytest.raises(TypeError, match="to_pyarrow_dataset"):
+        dt.to_pandas(filters=ds.field("year") == "2021")
 
 
 @pytest.mark.pyarrow
-def test_file_pruning_predicate_falls_back_to_dataset(monkeypatch):
-    calls = _spy_dataset_path(monkeypatch)
+def test_removed_parameters_rejected():
     dt = DeltaTable(PARTITIONED_TABLE)
-
-    with pytest.warns(
-        DeprecationWarning, match="`file_pruning_predicate` is deprecated"
+    for kwargs in (
+        {"file_pruning_predicate": "year = '2021'"},
+        {"partitions": [("year", "=", "2021")]},
+        {"filesystem": "unused"},
     ):
-        by_tuples = dt.to_pyarrow_table(file_pruning_predicate=[("year", "=", "2021")])
-    assert len(calls) == 1
-    assert by_tuples.num_rows == 4
-
-    with pytest.warns(
-        DeprecationWarning, match="`file_pruning_predicate` is deprecated"
-    ):
-        by_sql = dt.to_pyarrow_table(file_pruning_predicate="year = '2021'")
-    assert len(calls) == 2
-    assert _rows(by_sql) == _rows(by_tuples)
-
-    # the deprecated partitions parameter takes the same path
-    with pytest.warns(DeprecationWarning, match="`partitions` is deprecated"):
-        by_partitions = dt.to_pyarrow_table(partitions=[("year", "=", "2021")])
-    assert len(calls) == 3
-    assert _rows(by_partitions) == _rows(by_tuples)
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            dt.to_pyarrow_table(**kwargs)
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            dt.to_pandas(**kwargs)
 
 
 @pytest.mark.pyarrow
-def test_custom_filesystem_falls_back_to_dataset(monkeypatch):
-    import pyarrow.fs as pa_fs
-
-    calls = _spy_dataset_path(monkeypatch)
-    root = (Path.cwd().parent / PARTITIONED_TABLE.removeprefix("../")).as_posix()
-    filesystem = pa_fs.SubTreeFileSystem(root, pa_fs.LocalFileSystem())
-
-    with pytest.warns(DeprecationWarning, match="`filesystem` is deprecated"):
-        table = DeltaTable(PARTITIONED_TABLE).to_pyarrow_table(filesystem=filesystem)
-    assert len(calls) == 1
-    assert table.num_rows == 7
-
-
-@pytest.mark.pyarrow
-def test_unrenderable_filter_value_falls_back_to_dataset(tmp_path, monkeypatch):
+def test_unrenderable_filter_value_raises(tmp_path):
     import pyarrow as pa
 
     write_deltalake(tmp_path, pa.table({"x": [1.0, 2.0]}))
-    calls = _spy_dataset_path(monkeypatch)
+    dt = DeltaTable(tmp_path)
 
-    # an implementation detail, not a deprecated surface: no warning
-    with _no_deprecations():
-        table = DeltaTable(tmp_path).to_pyarrow_table(
-            filters=[("x", "=", float("nan"))]
-        )
-    assert len(calls) == 1
-    assert table.num_rows == 0
+    with pytest.raises(ValueError, match="non-finite float"):
+        dt.to_pyarrow_table(filters=[("x", "=", float("nan"))])
+    with pytest.raises(ValueError, match="no SQL literal"):
+        dt.to_pyarrow_table(filters=[("x", "=", b"\x00")])
 
 
 @pytest.mark.pyarrow
-def test_empty_projection_falls_back_to_dataset(monkeypatch):
-    calls = _spy_dataset_path(monkeypatch)
-    with _no_deprecations():
-        table = DeltaTable(PARTITIONED_TABLE).to_pyarrow_table(columns=[])
-    assert len(calls) == 1
-    assert table.num_columns == 0
-    assert table.num_rows == 7
-
-
-@pytest.mark.pyarrow
-def test_querybuilder_path_does_not_warn():
-    dt = DeltaTable(PARTITIONED_TABLE)
-    with _no_deprecations():
-        dt.to_pyarrow_table(columns=["value"], filters=[("year", "=", "2021")])
-
-
-@pytest.mark.pandas
-@pytest.mark.pyarrow
-def test_deprecation_warnings_point_at_the_caller():
-    dt = DeltaTable(PARTITIONED_TABLE)
-
-    with pytest.warns(DeprecationWarning) as records:
-        dt.to_pyarrow_table(file_pruning_predicate="year = '2021'")
-    with pytest.warns(DeprecationWarning) as pandas_records:
-        dt.to_pandas(file_pruning_predicate="year = '2021'")
-
-    for record in list(records) + list(pandas_records):
-        assert record.filename == __file__
+def test_empty_projection_raises():
+    with pytest.raises(ValueError, match="empty projection"):
+        DeltaTable(PARTITIONED_TABLE).to_pyarrow_table(columns=[])
 
 
 @pytest.mark.pandas
@@ -227,11 +142,9 @@ def test_column_mapped_table_reads():
 
 @pytest.mark.pyarrow
 def test_column_mapped_table_still_rejected_on_dataset_path():
-    import pyarrow.dataset as ds
-
     dt = DeltaTable(COLUMN_MAPPED_TABLE)
     with pytest.raises(DeltaProtocolError, match="minimum reader version"):
-        dt.to_pyarrow_table(filters=ds.field("Super Name") == "Timothy Lamb")
+        dt.to_pyarrow_dataset()
 
 
 @pytest.mark.pyarrow

@@ -60,11 +60,11 @@ groups:
 ```
 
 The parameter belongs to the file-level APIs: `file_uris`, `partitions`, and
-`to_pyarrow_dataset`. On `to_pandas` and `to_pyarrow_table` it still works but
-is deprecated, since tuple `filters` there prune files and filter rows in one
-step. The older `partitions` and `partition_filters` parameters are likewise
-deprecated. The predicate may reference any column, not just partition
-columns:
+`to_pyarrow_dataset`. The dataframe reads `to_pandas` and `to_pyarrow_table`
+do not take it, since tuple `filters` there prune files and filter rows in
+one step. The older `partitions` and `partition_filters` parameters on the
+file-level APIs are deprecated in its favor. The predicate may reference any
+column, not just partition columns:
 
 - **Partition columns** prune exactly: every returned file matches the
   predicate, and only matching files are returned.

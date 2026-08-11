@@ -859,14 +859,16 @@ def test_to_pandas_predicate_with_filters_exact(tmp_path: Path):
     write_deltalake(tmp_path, pa.table({"value": [100, 200, 300]}), mode="append")
     dt = DeltaTable(tmp_path)
 
-    # predicate alone prunes files, so whole surviving files come back
-    superset = dt.to_pandas(file_pruning_predicate="value >= 150")
+    # the predicate prunes files, so whole surviving files come back
+    superset = (
+        dt.to_pyarrow_dataset(file_pruning_predicate="value >= 150")
+        .to_table()
+        .to_pandas()
+    )
     assert sorted(superset["value"]) == [100, 200, 300]
 
-    # pairing it with a row filter gives exact rows
-    exact = dt.to_pandas(
-        file_pruning_predicate="value >= 150", filters=[("value", ">=", 150)]
-    )
+    # row filters on the dataframe read give exact rows
+    exact = dt.to_pandas(filters=[("value", ">=", 150)])
     assert sorted(exact["value"]) == [200, 300]
 
 
@@ -943,7 +945,8 @@ def test_delta_table_with_filesystem():
     table_path = "../crates/test/tests/data/simple_table"
     dt = DeltaTable(table_path)
     filesystem = SubTreeFileSystem(table_path, LocalFileSystem())
-    assert dt.to_pandas(filesystem=filesystem).equals(pd.DataFrame({"id": [5, 7, 9]}))
+    df = dt.to_pyarrow_dataset(filesystem=filesystem).to_table().to_pandas()
+    assert df.equals(pd.DataFrame({"id": [5, 7, 9]}))
 
 
 @pytest.mark.pyarrow
@@ -957,11 +960,7 @@ def test_delta_table_with_filters():
 
     filter_expr = ds.field("date") > "2021-02-20"
     data = dataset.to_table(filter=filter_expr)
-    assert (
-        len(dt.to_pandas(filters=[("date", ">", "2021-02-20")]))
-        == len(dt.to_pandas(filters=filter_expr))
-        == data.num_rows
-    )
+    assert len(dt.to_pandas(filters=[("date", ">", "2021-02-20")])) == data.num_rows
 
     filter_expr = (ds.field("date") > "2021-02-20") | (
         ds.field("state").isin(["Alabama", "Wyoming"])
@@ -976,7 +975,6 @@ def test_delta_table_with_filters():
                 ]
             )
         )
-        == len(dt.to_pandas(filters=filter_expr))
         == data.num_rows
     )
 
@@ -993,7 +991,6 @@ def test_delta_table_with_filters():
                 ]
             )
         )
-        == len(dt.to_pandas(filters=filter_expr))
         == data.num_rows
     )
 
@@ -1007,12 +1004,9 @@ def test_writer_fails_on_protocol():
     dt.protocol = Mock(return_value=ProtocolVersions(2, 1, None, None))
     with pytest.raises(DeltaProtocolError):
         dt.to_pyarrow_dataset()
-    # the version guard only applies to reads forced through the pyarrow
-    # dataset path; the DataFusion path reads newer protocols natively
-    with pytest.raises(DeltaProtocolError):
-        dt.to_pyarrow_table(file_pruning_predicate=[("id", "=", "5")])
-    with pytest.raises(DeltaProtocolError):
-        dt.to_pandas(file_pruning_predicate=[("id", "=", "5")])
+    # the version guard only applies to the pyarrow dataset path; the
+    # DataFusion read does not consult it
+    assert dt.to_pyarrow_table().num_rows == 3
 
 
 class ExcPassThroughThread(Thread):
