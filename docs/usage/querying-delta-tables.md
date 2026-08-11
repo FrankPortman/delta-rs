@@ -42,11 +42,7 @@ is a conjunction (AND); a list of such lists is an OR across the inner AND
 groups:
 
 ``` python
->>> # SQL string
 >>> dt.to_pandas(file_pruning_predicate="(year = 2020 AND month = 2) OR (year = 2021 AND month = 12)")
->>> # flat list of tuples: a single conjunction, year = 2020 AND month = 2
->>> dt.to_pandas(file_pruning_predicate=[("year", "=", "2020"), ("month", "=", "2")])
->>> # list of lists: OR across the inner AND groups
 >>> dt.to_pandas(
 ...     file_pruning_predicate=[
 ...         [("year", "=", "2020"), ("month", "=", "2")],
@@ -67,11 +63,7 @@ column, not just partition columns:
   in the transaction log: files that provably contain no matching row are
   dropped, every file that *may* contain one is kept, and files without
   statistics for a referenced column are always kept. The result is a
-  complete superset of the matching files. How much gets pruned depends on the
-  data layout: statistics only rule out files when similar values are
-  colocated, for example by partitioning or z-ordering on the column. See
-  [Delta Lake File Skipping](../how-delta-lake-works/delta-lake-file-skipping.md)
-  for how to lay out tables so predicates prune well.
+  complete superset of the matching files.
 
 As the name says, the predicate prunes files, not rows. Pair it with an
 equivalent `filters=` expression when you need exact rows from a
