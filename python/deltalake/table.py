@@ -225,6 +225,47 @@ def _read_query(columns: list[str] | None, filters: FilterType | None) -> str:
     return query
 
 
+def _warn_pyarrow_fallbacks(
+    partitions: FilterType | None,
+    filesystem: str | pa_fs.FileSystem | None,
+    filters: FilterType | Expression | None,
+    file_pruning_predicate: FilePruningPredicateType | None,
+) -> None:
+    """Warn on the pyarrow fallback triggers that `to_pyarrow_table` and
+    `to_pandas` are converging away from. Written for callers two frames up:
+    the warnings point at the code calling the public read method."""
+    if filesystem is not None:
+        warnings.warn(
+            "`filesystem` is deprecated on to_pyarrow_table and to_pandas; "
+            "use to_pyarrow_dataset(filesystem=...) when you need filesystem control",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    if filters is not None and not isinstance(filters, list):
+        warnings.warn(
+            "passing a pyarrow Expression as `filters` is deprecated on "
+            "to_pyarrow_table and to_pandas; pass tuple filters, or filter "
+            "to_pyarrow_dataset() directly",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    if file_pruning_predicate is not None:
+        warnings.warn(
+            "`file_pruning_predicate` is deprecated on to_pyarrow_table and "
+            "to_pandas; tuple `filters` prune files and filter rows exactly, "
+            "or use to_pyarrow_dataset for file-level control",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    if partitions is not None:
+        warnings.warn(
+            "`partitions` is deprecated on to_pyarrow_table and to_pandas; "
+            "pass tuple `filters` instead",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
 class _KeywordArgDefault:
     """Sentinel that preserves the rendered default while tracking omission."""
 
@@ -1302,24 +1343,35 @@ class DeltaTable:
         Everything else scans through a pyarrow dataset: a
         `pyarrow.dataset.Expression` as `filters`, a custom `filesystem`, or
         `file_pruning_predicate`, which selects which *files* are read before
-        any data is scanned; see the `file_uris` docstring for its syntax and
-        pruning semantics. A pruning predicate on a non-partition column selects
-        a superset of files, so pair it with an equivalent `filters` expression
-        when you need exact rows:
-
-        ```python
-        dt.to_pyarrow_table(
-            file_pruning_predicate="value >= 100", filters=[("value", ">=", 100)]
-        )
-        ```
+        any data is scanned. These fallbacks are deprecated on this method and
+        emit a `DeprecationWarning`: use `to_pyarrow_dataset` when another
+        engine consumes the data or you need pyarrow-specific control, and
+        tuple `filters` for row filtering.
 
         Args:
-            partitions: Deprecated. Pass tuple filters to `file_pruning_predicate` instead
+            partitions: Deprecated. Pass tuple `filters` instead
             columns: The columns to project. This can be a list of column names to include (order and duplicates will be preserved)
-            filesystem: A concrete implementation of the Pyarrow FileSystem or a fsspec-compatible interface. If None, the first file path will be used to determine the right FileSystem
-            filters: A disjunctive normal form (DNF) predicate for filtering rows, or directly a pyarrow.dataset.Expression
-            file_pruning_predicate: A SQL predicate string or tuple filters selecting the files to read
+            filesystem: Deprecated. Use `to_pyarrow_dataset(filesystem=...)` when you need filesystem control
+            filters: A disjunctive normal form (DNF) predicate for filtering rows. Passing a pyarrow.dataset.Expression is deprecated; filter `to_pyarrow_dataset()` directly instead
+            file_pruning_predicate: Deprecated. Tuple `filters` prune files and filter rows exactly; `to_pyarrow_dataset` keeps the parameter for file-level control
         """
+        _warn_pyarrow_fallbacks(partitions, filesystem, filters, file_pruning_predicate)
+        return self._to_pyarrow_table(
+            partitions=partitions,
+            columns=columns,
+            filesystem=filesystem,
+            filters=filters,
+            file_pruning_predicate=file_pruning_predicate,
+        )
+
+    def _to_pyarrow_table(
+        self,
+        partitions: FilterType | None = None,
+        columns: list[str] | None = None,
+        filesystem: str | pa_fs.FileSystem | None = None,
+        filters: FilterType | Expression | None = None,
+        file_pruning_predicate: FilePruningPredicateType | None = None,
+    ) -> "pyarrow.Table":
         query: str | None = None
         if (
             filesystem is None
@@ -1384,17 +1436,18 @@ class DeltaTable:
         `columns` and tuple `filters` run through the embedded DataFusion engine
         and filter rows exactly; a `pyarrow.dataset.Expression`, a custom
         `filesystem` or `file_pruning_predicate` scan through a pyarrow dataset
-        instead, with file-level pruning as described in `file_uris`.
+        instead. Those fallbacks are deprecated here, as on `to_pyarrow_table`.
 
         Args:
-            partitions: Deprecated. Pass tuple filters to `file_pruning_predicate` instead
+            partitions: Deprecated. Pass tuple `filters` instead
             columns: The columns to project. This can be a list of column names to include (order and duplicates will be preserved)
-            filesystem: A concrete implementation of the Pyarrow FileSystem or a fsspec-compatible interface. If None, the first file path will be used to determine the right FileSystem
-            filters: A disjunctive normal form (DNF) predicate for filtering rows, or directly a pyarrow.dataset.Expression
+            filesystem: Deprecated. Use `to_pyarrow_dataset(filesystem=...)` when you need filesystem control
+            filters: A disjunctive normal form (DNF) predicate for filtering rows. Passing a pyarrow.dataset.Expression is deprecated; filter `to_pyarrow_dataset()` directly instead
             types_mapper: A function mapping a pyarrow DataType to a pandas ExtensionDtype
-            file_pruning_predicate: A SQL predicate string or tuple filters selecting the files to read
+            file_pruning_predicate: Deprecated. Tuple `filters` prune files and filter rows exactly; `to_pyarrow_dataset` keeps the parameter for file-level control
         """
-        return self.to_pyarrow_table(
+        _warn_pyarrow_fallbacks(partitions, filesystem, filters, file_pruning_predicate)
+        return self._to_pyarrow_table(
             partitions=partitions,
             columns=columns,
             filesystem=filesystem,
