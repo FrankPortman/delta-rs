@@ -359,13 +359,13 @@ support filtering partitions and selecting particular columns.
     year: string
     month: string
     day: string
-    >>> dt.to_pandas(partitions=[("year", "=", "2021")], columns=["value"])
+    >>> dt.to_pandas(filters=[("year", "=", "2021")], columns=["value"])
           value
     0     6
     1     7
     2     5
     3     4
-    >>> dt.to_pyarrow_table(partitions=[("year", "=", "2021")], columns=["value"])
+    >>> dt.to_pyarrow_table(filters=[("year", "=", "2021")], columns=["value"])
     pyarrow.Table
     value: string
 
