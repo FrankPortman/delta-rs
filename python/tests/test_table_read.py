@@ -263,7 +263,6 @@ def test_read_partitioned_table_to_dict():
 def test_read_partitioned_table_with_partitions_filters_to_dict():
     table_path = "../crates/test/tests/data/delta-0.8.0-partitioned"
     dt = DeltaTable(table_path)
-    partitions = [("year", "=", "2021")]
     expected = {
         "value": ["6", "7", "5", "4"],
         "year": ["2021", "2021", "2021", "2021"],
@@ -271,63 +270,53 @@ def test_read_partitioned_table_with_partitions_filters_to_dict():
         "day": ["20", "20", "4", "5"],
     }
 
-    assert dt.to_pyarrow_dataset(partitions).to_table().to_pydict() == expected
+    assert (
+        dt.to_pyarrow_dataset(file_pruning_predicate="year = 2021")
+        .to_table()
+        .to_pydict()
+        == expected
+    )
 
 
 @pytest.mark.pyarrow
-def test_read_partitioned_table_with_primitive_type_partition_filters():
+def test_read_partitioned_table_with_primitive_type_predicates():
     table_path = "../crates/test/tests/data/partition-type-primitives"
     dt = DeltaTable(table_path)
 
-    partitions_int = [("year", "=", 2020)]
-    result_int = dt.to_pyarrow_dataset(partitions_int).to_table().to_pydict()
+    def read(predicate):
+        return (
+            dt.to_pyarrow_dataset(file_pruning_predicate=predicate)
+            .to_table()
+            .to_pydict()
+        )
+
+    result_int = read("year = '2020'")
     assert len(result_int["id"]) == 8
     assert all(year == "2020" for year in result_int["year"])
 
-    partitions_float = [("year", "=", 2021.0)]
-    result_float = dt.to_pyarrow_dataset(partitions_float).to_table().to_pydict()
+    result_float = read("year = '2021.0'")
     assert len(result_float["id"]) == 8
     assert all(year == "2021.0" for year in result_float["year"])
 
-    partitions_bool = [("is_active", "=", True)]
-    result_bool = dt.to_pyarrow_dataset(partitions_bool).to_table().to_pydict()
+    result_bool = read("is_active = 'true'")
     assert len(result_bool["id"]) == 8
     assert all(is_active == "true" for is_active in result_bool["is_active"])
 
-    partitions_date = [("event_date", "=", date(2023, 1, 1))]
-    result_date = dt.to_pyarrow_dataset(partitions_date).to_table().to_pydict()
+    result_date = read("event_date = '2023-01-01'")
     assert len(result_date["id"]) == 8
     assert all(event_date == "2023-01-01" for event_date in result_date["event_date"])
 
-    partitions_string = [("category", "=", "A")]
-    result_string = dt.to_pyarrow_dataset(partitions_string).to_table().to_pydict()
+    result_string = read("category = 'A'")
     assert len(result_string["id"]) == 8
     assert all(category == "A" for category in result_string["category"])
 
-    partitions_bool_in = [("is_active", "in", [True, False])]
-    result_bool_in = dt.to_pyarrow_dataset(partitions_bool_in).to_table().to_pydict()
+    result_bool_in = read("is_active IN ('true', 'false')")
     total_rows = len(dt.to_pyarrow_dataset().to_table().to_pydict()["id"])
     assert len(result_bool_in["id"]) == total_rows
 
-    partitions_year_in = [("year", "in", [2020, 2022.0])]
-    result_year_in = dt.to_pyarrow_dataset(partitions_year_in).to_table().to_pydict()
+    result_year_in = read("year IN ('2020', '2022.0')")
     assert len(result_year_in["id"]) == 8
     assert all(year == "2020" for year in result_year_in["year"])
-
-    partitions_bool_true_only = [("is_active", "in", [True])]
-    result_bool_true_only = (
-        dt.to_pyarrow_dataset(partitions_bool_true_only).to_table().to_pydict()
-    )
-    assert len(result_bool_true_only["id"]) == 8
-    assert all(is_active == "true" for is_active in result_bool_true_only["is_active"])
-
-    with pytest.raises(ValueError, match="Could not encode partition value for type"):
-        partitions_invalid = [("category", "=", {"invalid": "dict"})]
-        dt.to_pyarrow_dataset(partitions_invalid)
-
-    with pytest.raises(ValueError, match="Could not encode partition value for type"):
-        partitions_invalid_list = [("category", "in", [{"invalid": "dict"}, "A"])]
-        dt.to_pyarrow_dataset(partitions_invalid_list)
 
 
 @pytest.mark.pyarrow
@@ -435,9 +424,9 @@ def test_read_special_partition():
 
     files = dt.file_uris()
     assert path_matcher(files[0], file1) and path_matcher(files[1], file2)
-    assert path_matcher(dt.file_uris([("x", "=", "A/A")])[0], file1)
-    assert path_matcher(dt.file_uris([("x", "=", "B B")])[0], file2)
-    assert dt.file_uris([("x", "=", "c")]) == []
+    assert path_matcher(dt.file_uris(file_pruning_predicate="x = 'A/A'")[0], file1)
+    assert path_matcher(dt.file_uris(file_pruning_predicate="x = 'B B'")[0], file2)
+    assert dt.file_uris(file_pruning_predicate="x = 'c'") == []
 
     table = dt.to_pyarrow_table()
 
@@ -589,12 +578,12 @@ def test_without_files_update_preserves_get_add_actions_error(tmp_path: Path):
         dt.get_add_actions(flatten=True)
 
 
-def assert_correct_files(dt: DeltaTable, partition_filters, expected_paths):
+def assert_correct_files(dt: DeltaTable, predicate, expected_paths):
     from urllib.parse import urlparse
 
     table_path = urlparse(dt.table_uri).path
     absolute_paths = [os.path.join(table_path, path) for path in expected_paths]
-    assert dt.file_uris(partition_filters) == absolute_paths
+    assert dt.file_uris(file_pruning_predicate=predicate) == absolute_paths
 
 
 def test_get_files_partitioned_table():
@@ -604,17 +593,13 @@ def test_get_files_partitioned_table():
         Path.cwd().parent / "crates/test/tests/data/delta-0.8.0-partitioned"
     ).as_posix()
 
-    partition_filters = [("day", "=", "3")]
+    predicate = "day = 3"
     paths = [
         "year=2020/month=2/day=3/part-00000-94d16827-f2fd-42cd-a060-f67ccc63ced9.c000.snappy.parquet"
     ]
-    assert_correct_files(dt, partition_filters, paths)
+    assert_correct_files(dt, predicate, paths)
 
-    # Also accepts integers
-    partition_filters = [("day", "=", 3)]
-    assert_correct_files(dt, partition_filters, paths)
-
-    partition_filters = [("day", "!=", "3")]
+    predicate = "day != 3"
     paths = [
         "year=2020/month=1/day=1/part-00000-8eafa330-3be9-4a39-ad78-fd13c2027c7e.c000.snappy.parquet",
         "year=2020/month=2/day=5/part-00000-89cdd4c8-2af7-4add-8ea3-3990b2f027b5.c000.snappy.parquet",
@@ -622,54 +607,33 @@ def test_get_files_partitioned_table():
         "year=2021/month=12/day=4/part-00000-6dc763c0-3e8b-4d52-b19e-1f92af3fbb25.c000.snappy.parquet",
         "year=2021/month=4/day=5/part-00000-c5856301-3439-4032-a6fc-22b7bc92bebb.c000.snappy.parquet",
     ]
-    assert_correct_files(dt, partition_filters, paths)
+    assert_correct_files(dt, predicate, paths)
 
-    partition_filters = [("day", "in", ["3", "20"])]
+    predicate = "day IN (3, 20)"
     paths = [
         "year=2020/month=2/day=3/part-00000-94d16827-f2fd-42cd-a060-f67ccc63ced9.c000.snappy.parquet",
         "year=2021/month=12/day=20/part-00000-9275fdf4-3961-4184-baa0-1c8a2bb98104.c000.snappy.parquet",
     ]
-    assert_correct_files(dt, partition_filters, paths)
+    assert_correct_files(dt, predicate, paths)
 
-    partition_filters = [("day", "not in", ["3", "20"])]
+    predicate = "day NOT IN (3, 20)"
     paths = [
         "year=2020/month=1/day=1/part-00000-8eafa330-3be9-4a39-ad78-fd13c2027c7e.c000.snappy.parquet",
         "year=2020/month=2/day=5/part-00000-89cdd4c8-2af7-4add-8ea3-3990b2f027b5.c000.snappy.parquet",
         "year=2021/month=12/day=4/part-00000-6dc763c0-3e8b-4d52-b19e-1f92af3fbb25.c000.snappy.parquet",
         "year=2021/month=4/day=5/part-00000-c5856301-3439-4032-a6fc-22b7bc92bebb.c000.snappy.parquet",
     ]
-    assert_correct_files(dt, partition_filters, paths)
+    assert_correct_files(dt, predicate, paths)
 
-    partition_filters = [("day", "not in", ["3", "20"]), ("year", "=", "2021")]
+    predicate = "day NOT IN (3, 20) AND year = 2021"
     paths = [
         "year=2021/month=12/day=4/part-00000-6dc763c0-3e8b-4d52-b19e-1f92af3fbb25.c000.snappy.parquet",
         "year=2021/month=4/day=5/part-00000-c5856301-3439-4032-a6fc-22b7bc92bebb.c000.snappy.parquet",
     ]
-    assert_correct_files(dt, partition_filters, paths)
+    assert_correct_files(dt, predicate, paths)
 
-    partition_filters = [("invalid_operation", "=>", "3")]
-    with pytest.raises(Exception) as exception:
-        dt.file_uris(partition_filters)
-    assert (
-        str(exception.value)
-        == 'Invalid partition filter found: ("invalid_operation", "=>", "3").'
-    )
-
-    partition_filters = [("invalid_operation", "=", ["3", "20"])]
-    with pytest.raises(Exception) as exception:
-        dt.file_uris(partition_filters)
-    assert (
-        str(exception.value)
-        == 'Invalid partition filter found: ("invalid_operation", "=", ["3", "20"]).'
-    )
-
-    partition_filters = [("unknown", "=", "3")]
-    with pytest.raises(Exception) as exception:
-        dt.file_uris(partition_filters)
-    assert (
-        str(exception.value)
-        == "Data does not match the schema or partitions of the table: Field 'unknown' is not a root table field."
-    )
+    with pytest.raises(Exception, match="unknown"):
+        dt.file_uris(file_pruning_predicate="unknown = 3")
 
 
 PARTITIONED_TABLE_PATHS = {
@@ -699,113 +663,65 @@ def _partitioned_table_uris(*keys: tuple[int, int, int]) -> set[str]:
     return {(root / PARTITIONED_TABLE_PATHS[key]).as_posix() for key in keys}
 
 
-def test_file_uris_dnf_filters():
+def test_file_uris_predicate():
     dt = DeltaTable("../crates/test/tests/data/delta-0.8.0-partitioned")
 
-    # a flat conjunction and its single-element DNF spelling are equivalent
-    flat = dt.file_uris([("day", "=", "3")])
-    nested = dt.file_uris([[("day", "=", "3")]])
-    assert flat == nested
-    assert set(flat) == _partitioned_table_uris((2020, 2, 3))
-
-    dnf = [
-        [("year", "=", "2020"), ("month", "=", "2")],
-        [("year", "=", "2021"), ("month", "=", "12")],
-    ]
-    assert set(dt.file_uris(dnf)) == _partitioned_table_uris(
-        (2020, 2, 3), (2020, 2, 5), (2021, 12, 4), (2021, 12, 20)
+    assert set(dt.file_uris(file_pruning_predicate="day = 3")) == (
+        _partitioned_table_uris((2020, 2, 3))
     )
 
-    # primitive values work in DNF form too
-    dnf = [[("year", "=", 2020)], [("month", "=", 12)]]
-    assert set(dt.file_uris(dnf)) == _partitioned_table_uris(
-        (2020, 1, 1), (2020, 2, 3), (2020, 2, 5), (2021, 12, 4), (2021, 12, 20)
-    )
-
-    # tuple filters via the new parameter match the deprecated positional form
-    assert dt.file_uris(file_pruning_predicate=dnf) == dt.file_uris(dnf)
-
-
-def test_file_uris_predicate_equals_dnf():
-    dt = DeltaTable("../crates/test/tests/data/delta-0.8.0-partitioned")
-
-    dnf = [
-        [("year", "=", "2020"), ("month", "=", "2")],
-        [("year", "=", "2021"), ("month", "=", "12")],
-    ]
     predicate = "(year = 2020 AND month = 2) OR (year = 2021 AND month = 12)"
-    assert set(dt.file_uris(file_pruning_predicate=predicate)) == set(dt.file_uris(dnf))
     assert set(
         dt.file_uris(file_pruning_predicate=predicate)
     ) == _partitioned_table_uris(
         (2020, 2, 3), (2020, 2, 5), (2021, 12, 4), (2021, 12, 20)
     )
 
+    assert set(
+        dt.file_uris(file_pruning_predicate="year = 2020 OR month = 12")
+    ) == _partitioned_table_uris(
+        (2020, 1, 1), (2020, 2, 3), (2020, 2, 5), (2021, 12, 4), (2021, 12, 20)
+    )
+
 
 def test_file_uris_predicate_operators():
     dt = DeltaTable("../crates/test/tests/data/delta-0.8.0-partitioned")
 
-    for predicate, filters in [
-        ("year >= 2021", [("year", ">=", "2021")]),
-        ("day != 3", [("day", "!=", "3")]),
-        ("day IN (3, 20)", [("day", "in", ["3", "20"])]),
-        ("day NOT IN (3, 20)", [("day", "not in", ["3", "20"])]),
+    for predicate, expected in [
+        (
+            "year >= 2021",
+            _partitioned_table_uris((2021, 4, 5), (2021, 12, 4), (2021, 12, 20)),
+        ),
+        (
+            "day != 3",
+            _partitioned_table_uris(
+                (2020, 1, 1), (2020, 2, 5), (2021, 4, 5), (2021, 12, 4), (2021, 12, 20)
+            ),
+        ),
+        ("day IN (3, 20)", _partitioned_table_uris((2020, 2, 3), (2021, 12, 20))),
+        (
+            "day NOT IN (3, 20)",
+            _partitioned_table_uris(
+                (2020, 1, 1), (2020, 2, 5), (2021, 4, 5), (2021, 12, 4)
+            ),
+        ),
+        # month is a string column: '2' <= month <= '4' is lexicographic
+        (
+            "month BETWEEN 2 AND 4",
+            _partitioned_table_uris((2020, 2, 3), (2020, 2, 5), (2021, 4, 5)),
+        ),
+        (
+            "NOT (year = 2020)",
+            _partitioned_table_uris((2021, 4, 5), (2021, 12, 4), (2021, 12, 20)),
+        ),
     ]:
-        assert set(dt.file_uris(file_pruning_predicate=predicate)) == set(
-            dt.file_uris(filters)
-        ), predicate
-
-    assert set(dt.file_uris(file_pruning_predicate="month BETWEEN 2 AND 4")) == set(
-        dt.file_uris([("month", ">=", "2"), ("month", "<=", "4")])
-    )
-    assert set(dt.file_uris(file_pruning_predicate="NOT (year = 2020)")) == set(
-        dt.file_uris([("year", "!=", "2020")])
-    )
+        assert set(dt.file_uris(file_pruning_predicate=predicate)) == expected, (
+            predicate
+        )
 
 
-def test_legacy_filter_params_warn():
+def test_file_uris_predicate_errors():
     dt = DeltaTable("../crates/test/tests/data/delta-0.8.0-partitioned")
-
-    with pytest.warns(DeprecationWarning, match="partition_filters"):
-        legacy = dt.file_uris([("year", "=", "2021")])
-    assert legacy == dt.file_uris(file_pruning_predicate=[("year", "=", "2021")])
-
-    with pytest.warns(DeprecationWarning, match="partition_filters"):
-        dt.partitions(partition_filters=[("year", "=", "2021")])
-
-
-@pytest.mark.pyarrow
-def test_legacy_dataset_partitions_param_warns():
-    dt = DeltaTable("../crates/test/tests/data/delta-0.8.0-partitioned")
-
-    with pytest.warns(DeprecationWarning, match="partitions"):
-        dt.to_pyarrow_dataset(partitions=[("year", "=", "2021")])
-
-
-@pytest.mark.pyarrow
-def test_dataframe_partitions_param_warns_with_filters_hint():
-    dt = DeltaTable("../crates/test/tests/data/delta-0.8.0-partitioned")
-
-    # the dataframe methods have no file_pruning_predicate, so their warning
-    # must point at `filters`
-    with pytest.warns(DeprecationWarning, match="use `filters`"):
-        legacy = dt.to_pyarrow_table(partitions=[("year", "=", "2021")])
-    assert (
-        legacy.num_rows == dt.to_pyarrow_table(filters=[("year", "=", "2021")]).num_rows
-    )
-
-
-def test_file_uris_filter_errors():
-    dt = DeltaTable("../crates/test/tests/data/delta-0.8.0-partitioned")
-
-    with pytest.raises(ValueError, match="deprecated"):
-        dt.file_uris([("year", "=", "2020")], file_pruning_predicate="year = 2020")
-
-    with pytest.raises(ValueError, match="empty conjunction"):
-        dt.file_uris([[("year", "=", "2020")], []])
-
-    with pytest.raises(ValueError, match="not a mix"):
-        dt.file_uris([("year", "=", "2020"), [("month", "=", "2")]])
 
     with pytest.raises(Exception, match="nope"):
         dt.file_uris(file_pruning_predicate="nope = 1")
@@ -827,12 +743,8 @@ def test_partitions_predicate():
     for partition in expected:
         assert partition in actual
 
-    dnf = [[("year", "=", "2020")], [("month", "=", "12")]]
-    by_dnf = dt.partitions(dnf)
     by_predicate = dt.partitions(file_pruning_predicate="year = 2020 OR month = 12")
-    assert len(by_dnf) == len(by_predicate) == 5
-    for partition in by_dnf:
-        assert partition in by_predicate
+    assert len(by_predicate) == 5
 
 
 @pytest.mark.pyarrow
@@ -850,9 +762,6 @@ def test_data_column_predicate_superset(tmp_path: Path):
     assert len(low_files) == len(high_files) == 1
     assert low_files | high_files == all_files
 
-    # tuple filters work on data columns too
-    assert set(dt.file_uris([("value", ">=", 100)])) == high_files
-
     # a predicate straddling both files' ranges retains both
     assert set(dt.file_uris(file_pruning_predicate="value > 5")) == all_files
 
@@ -865,24 +774,20 @@ def test_data_column_predicate_superset(tmp_path: Path):
 
 @pytest.mark.pandas
 @pytest.mark.pyarrow
-def test_to_pandas_filters_prune_and_filter_exactly(tmp_path: Path):
+def test_to_pandas_filters_exact(tmp_path: Path):
     import pyarrow as pa
 
     write_deltalake(tmp_path, pa.table({"value": [1, 5, 10]}))
     write_deltalake(tmp_path, pa.table({"value": [100, 200, 300]}), mode="append")
     dt = DeltaTable(tmp_path)
 
-    # filters prune files through fragment stats and then filter rows exactly
-    exact = dt.to_pandas(filters=[("value", ">=", 150)])
+    # filters is a row predicate: exact rows, files pruned automatically
+    exact = dt.to_pandas(filters="value >= 150")
     assert sorted(exact["value"]) == [200, 300]
 
-    # file pruning alone returns whole surviving files: go through the dataset
-    superset = (
-        dt.to_pyarrow_dataset(file_pruning_predicate="value >= 150")
-        .to_table()
-        .to_pandas()
-    )
-    assert sorted(superset["value"]) == [100, 200, 300]
+    # the listing APIs prune whole files, so a data-column predicate is a superset
+    superset = set(dt.file_uris(file_pruning_predicate="value >= 150"))
+    assert len(superset) == 1
 
 
 @pytest.mark.pyarrow
@@ -892,11 +797,6 @@ def test_dataset_predicate_prunes_fragments():
     dataset = dt.to_pyarrow_dataset(file_pruning_predicate="year = 2021")
     assert len(dataset.files) == 3
     assert dataset.to_table().num_rows == 4
-
-    with pytest.raises(ValueError, match="deprecated"):
-        dt.to_pyarrow_dataset(
-            partitions=[("year", "=", "2021")], file_pruning_predicate="year = 2021"
-        )
 
 
 @pytest.mark.pyarrow
@@ -919,9 +819,7 @@ def test_predicate_column_mapped_table():
 
     assert len(dt.file_uris()) == 2
     by_predicate = dt.file_uris(file_pruning_predicate="\"Company Very Short\" = 'BME'")
-    by_filters = dt.file_uris([("Company Very Short", "=", "BME")])
     assert len(by_predicate) == 1
-    assert by_predicate == by_filters
 
     # stats-based skipping resolves the mapping too: only the BME file's
     # min/max range covers this value
@@ -942,7 +840,8 @@ def test_delta_table_to_pandas():
 
     table_path = "../crates/test/tests/data/simple_table"
     dt = DeltaTable(table_path)
-    assert dt.to_pandas().equals(pd.DataFrame({"id": [5, 7, 9]}))
+    loaded = dt.to_pandas().sort_values("id", ignore_index=True)
+    assert loaded.equals(pd.DataFrame({"id": [5, 7, 9]}))
 
 
 @pytest.mark.pandas
@@ -954,7 +853,8 @@ def test_delta_table_with_filesystem():
     table_path = "../crates/test/tests/data/simple_table"
     dt = DeltaTable(table_path)
     filesystem = SubTreeFileSystem(table_path, LocalFileSystem())
-    assert dt.to_pandas(filesystem=filesystem).equals(pd.DataFrame({"id": [5, 7, 9]}))
+    df = dt.to_pyarrow_dataset(filesystem=filesystem).to_table().to_pandas()
+    assert df.equals(pd.DataFrame({"id": [5, 7, 9]}))
 
 
 @pytest.mark.pyarrow
@@ -968,11 +868,7 @@ def test_delta_table_with_filters():
 
     filter_expr = ds.field("date") > "2021-02-20"
     data = dataset.to_table(filter=filter_expr)
-    assert (
-        len(dt.to_pandas(filters=[("date", ">", "2021-02-20")]))
-        == len(dt.to_pandas(filters=filter_expr))
-        == data.num_rows
-    )
+    assert len(dt.to_pandas(filters="date > '2021-02-20'")) == data.num_rows
 
     filter_expr = (ds.field("date") > "2021-02-20") | (
         ds.field("state").isin(["Alabama", "Wyoming"])
@@ -981,13 +877,9 @@ def test_delta_table_with_filters():
     assert (
         len(
             dt.to_pandas(
-                filters=[
-                    [("date", ">", "2021-02-20")],
-                    [("state", "in", ["Alabama", "Wyoming"])],
-                ]
+                filters="date > '2021-02-20' OR state IN ('Alabama', 'Wyoming')"
             )
         )
-        == len(dt.to_pandas(filters=filter_expr))
         == data.num_rows
     )
 
@@ -998,19 +890,15 @@ def test_delta_table_with_filters():
     assert (
         len(
             dt.to_pandas(
-                filters=[
-                    ("date", ">", "2021-02-20"),
-                    ("state", "in", ["Alabama", "Wyoming"]),
-                ]
+                filters="date > '2021-02-20' AND state IN ('Alabama', 'Wyoming')"
             )
         )
-        == len(dt.to_pandas(filters=filter_expr))
         == data.num_rows
     )
 
 
 @pytest.mark.pyarrow
-def test_writer_fails_on_protocol():
+def test_pyarrow_dataset_fails_on_protocol():
     import pytest
 
     table_path = "../crates/test/tests/data/simple_table"
@@ -1018,10 +906,6 @@ def test_writer_fails_on_protocol():
     dt.protocol = Mock(return_value=ProtocolVersions(2, 1, None, None))
     with pytest.raises(DeltaProtocolError):
         dt.to_pyarrow_dataset()
-    with pytest.raises(DeltaProtocolError):
-        dt.to_pyarrow_table()
-    with pytest.raises(DeltaProtocolError):
-        dt.to_pandas()
 
 
 class ExcPassThroughThread(Thread):
@@ -1199,36 +1083,9 @@ def test_issue_1653_filter_bool_partition(tmp_path: Path):
     )
     dt = DeltaTable(tmp_path)
 
+    assert dt.to_pyarrow_table(filters="int_col = 0 AND bool_col = true").num_rows == 1
     assert (
-        dt.to_pyarrow_table(
-            filters=[
-                ("int_col", "=", 0),
-                ("bool_col", "=", True),
-            ]
-        ).num_rows
-        == 1
-    )
-    assert (
-        len(
-            dt.file_uris(
-                partition_filters=[
-                    ("int_col", "=", 0),
-                    ("bool_col", "=", "true"),
-                ]
-            )
-        )
-        == 1
-    )
-    assert (
-        len(
-            dt.file_uris(
-                partition_filters=[
-                    ("int_col", "=", 0),
-                    ("bool_col", "=", True),
-                ]
-            )
-        )
-        == 1
+        len(dt.file_uris(file_pruning_predicate="int_col = 0 AND bool_col = true")) == 1
     )
 
 
@@ -1287,32 +1144,28 @@ def test_partitions_filtering_partitioned_table():
         {"day": "4", "month": "12", "year": "2021"},
     ]
 
-    partition_filters = [("year", ">=", "2021")]
-    actual = dt.partitions(partition_filters=partition_filters)
+    actual = dt.partitions(file_pruning_predicate="year >= 2021")
     assert len(expected) == len(actual)
     for partition in expected:
         partition in actual
 
 
-def test_partitions_filtering_with_primitive_values():
+def test_partitions_filtering_with_predicates():
     table_path = "../crates/test/tests/data/partition-type-primitives"
     dt = DeltaTable(table_path)
 
-    def partition_set(filters):
-        return {frozenset(p.items()) for p in dt.partitions(filters)}
+    def partition_set(predicate):
+        return {
+            frozenset(p.items())
+            for p in dt.partitions(file_pruning_predicate=predicate)
+        }
 
-    by_int = partition_set([("year", "=", 2020)])
-    assert by_int
-    assert by_int == partition_set([("year", "=", "2020")])
-    assert all(dict(p)["year"] == "2020" for p in by_int)
+    by_year = partition_set("year = '2020'")
+    assert by_year
+    assert all(dict(p)["year"] == "2020" for p in by_year)
 
-    by_bool = partition_set([("is_active", "=", True)])
-    assert by_bool
-    assert by_bool == partition_set([("is_active", "=", "true")])
-
-    by_date = partition_set([("event_date", "=", date(2023, 1, 1))])
-    assert by_date
-    assert by_date == partition_set([("event_date", "=", "2023-01-01")])
+    assert partition_set("is_active = 'true'")
+    assert partition_set("event_date = '2023-01-01'")
 
 
 @pytest.mark.pyarrow

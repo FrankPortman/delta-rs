@@ -12,7 +12,6 @@ from deltalake import DeltaTable, write_deltalake
 def test_stats_usage_3201(tmp_path):
     # https://github.com/delta-io/delta-rs/issues/3201
     # https://github.com/delta-io/delta-rs/issues/3173
-    import pandas as pd
     import polars as pl
     from polars.testing import assert_frame_equal
 
@@ -59,15 +58,15 @@ def test_stats_usage_3201(tmp_path):
     )
 
     dt = DeltaTable(tmp_path)
-    data = dt.to_pyarrow_table(filters=[("date", ">=", pd.Timestamp("2020-01-01"))])
+    data = dt.to_pyarrow_table(filters="date >= '2020-01-01'")
 
     assert_frame_equal(excepted, pl.from_arrow(data), check_row_order=False)
 
-    data = dt.to_pyarrow_table(filters=[("ref_date", ">=", pd.Timestamp("2020-01-01"))])
+    data = dt.to_pyarrow_table(filters="ref_date >= '2020-01-01'")
 
     assert_frame_equal(excepted, pl.from_arrow(data), check_row_order=False)
 
-    data = dt.to_pyarrow_table(filters=[("values", ">=", 0)])
+    data = dt.to_pyarrow_table(filters="values >= 0")
 
     assert_frame_equal(excepted, pl.from_arrow(data), check_row_order=False)
 
@@ -116,29 +115,13 @@ def test_microsecond_truncation_parquet_stats(tmp_path, use_stats_struct):
 
     dt = DeltaTable(tmp_path)
 
-    result = dt.to_pyarrow_table(
-        filters=[
-            (
-                "dt",
-                "<=",
-                datetime(2023, 3, 30, 0, 0, 0, 0, tzinfo=timezone.utc),
-            ),
-        ]
-    )
+    result = dt.to_pyarrow_table(filters="dt <= '2023-03-30T00:00:00Z'")
     assert batch1 == result
 
     dt.optimize.compact()
     dt.create_checkpoint()
 
-    result = dt.to_pyarrow_table(
-        filters=[
-            (
-                "dt",
-                "<=",
-                datetime(2023, 3, 30, 0, 0, 0, 0, tzinfo=timezone.utc),
-            ),
-        ]
-    )
+    result = dt.to_pyarrow_table(filters="dt <= '2023-03-30T00:00:00Z'")
     assert batch1 == result
 
 

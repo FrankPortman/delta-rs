@@ -57,8 +57,7 @@ use deltalake::parquet::basic::{Compression, Encoding};
 use deltalake::parquet::errors::ParquetError;
 use deltalake::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use deltalake::partitions::{
-    FilterLiteral, FilterValue, conjunction_to_kernel_predicate, dnf_to_kernel_predicate,
-    filter_literal,
+    FilterLiteral, FilterValue, conjunction_to_kernel_predicate, filter_literal,
 };
 use deltalake::protocol::log_compaction::compact_logs;
 use deltalake::protocol::{DeltaOperation, SaveMode};
@@ -127,14 +126,6 @@ enum PartitionFilterValue {
 /// Python side always sends filters as a list of these, i.e. in disjunctive
 /// normal form; a lone conjunction arrives as a single-element list.
 type PyFilterConjunction = Vec<(PyBackedStr, PyBackedStr, PartitionFilterValue)>;
-
-/// The file pruning predicate of the listing APIs: a SQL string, or tuple
-/// filters in disjunctive normal form.
-#[derive(FromPyObject)]
-enum PyFilePruningPredicate {
-    Sql(String),
-    Dnf(Vec<PyFilterConjunction>),
-}
 
 #[pyclass(module = "deltalake._internal", frozen)]
 struct RawDeltaTable {
@@ -313,27 +304,14 @@ impl RawDeltaTable {
 
     /// Resolve the file pruning predicate of the listing APIs into a kernel
     /// predicate.
-    fn resolve_files_predicate(
-        &self,
-        predicate: Option<PyFilePruningPredicate>,
-    ) -> PyResult<Option<PredicateRef>> {
-        let resolved = match predicate {
-            None => return Ok(None),
-            Some(PyFilePruningPredicate::Dnf(filters)) if filters.is_empty() => return Ok(None),
-            Some(PyFilePruningPredicate::Dnf(filters)) => {
-                kernel_dnf_predicate(&filters, self.snapshot_schema()?.as_ref())
-                    .map_err(PythonError::from)?
-            }
-            Some(PyFilePruningPredicate::Sql(sql)) => {
-                let session = SessionContext::new();
-                parse_sql_predicate_to_kernel(
-                    &sql,
-                    self.snapshot_schema()?.as_ref(),
-                    &session.state(),
-                )
-                .map_err(PythonError::from)?
-            }
+    fn resolve_files_predicate(&self, predicate: Option<String>) -> PyResult<Option<PredicateRef>> {
+        let Some(sql) = predicate else {
+            return Ok(None);
         };
+        let session = SessionContext::new();
+        let resolved =
+            parse_sql_predicate_to_kernel(&sql, self.snapshot_schema()?.as_ref(), &session.state())
+                .map_err(PythonError::from)?;
         Ok(Some(Arc::new(resolved)))
     }
 
@@ -613,7 +591,7 @@ impl RawDeltaTable {
     pub fn files(
         &self,
         py: Python,
-        file_pruning_predicate: Option<PyFilePruningPredicate>,
+        file_pruning_predicate: Option<String>,
     ) -> PyResult<Vec<String>> {
         if !self.has_files()? {
             return Err(DeltaError::new_err("Table is instantiated without files."));
@@ -645,10 +623,7 @@ impl RawDeltaTable {
     }
 
     #[pyo3(signature = (file_pruning_predicate=None))]
-    pub fn file_uris(
-        &self,
-        file_pruning_predicate: Option<PyFilePruningPredicate>,
-    ) -> PyResult<Vec<String>> {
+    pub fn file_uris(&self, file_pruning_predicate: Option<String>) -> PyResult<Vec<String>> {
         if !self.with_table(|t| Ok(t.config.require_files))? {
             return Err(DeltaError::new_err("Table is initiated without files."));
         }
@@ -1478,7 +1453,7 @@ impl RawDeltaTable {
         &self,
         py: Python<'py>,
         schema: PyArrowSchema,
-        file_pruning_predicate: Option<PyFilePruningPredicate>,
+        file_pruning_predicate: Option<String>,
     ) -> PyResult<Vec<(String, Option<Bound<'py, PyAny>>)>> {
         let path_set = if file_pruning_predicate.is_some() {
             Some(HashSet::<_>::from_iter(
@@ -1533,7 +1508,7 @@ impl RawDeltaTable {
     #[pyo3(signature = (file_pruning_predicate=None))]
     fn get_active_partitions<'py>(
         &self,
-        file_pruning_predicate: Option<PyFilePruningPredicate>,
+        file_pruning_predicate: Option<String>,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyFrozenSet>> {
         let schema = self.with_table(|t| {
@@ -1550,30 +1525,11 @@ impl RawDeltaTable {
                 .map_err(PyErr::from)?;
             Ok(snapshot.metadata().clone())
         })?;
-        let column_names: HashSet<&str> =
-            schema.fields().map(|field| field.name().as_str()).collect();
         let partition_columns: HashSet<&str> = metadata
             .partition_columns()
             .iter()
             .map(|col| col.as_str())
             .collect();
-
-        if let Some(PyFilePruningPredicate::Dnf(filters)) = &file_pruning_predicate {
-            let unknown_columns: Vec<&PyBackedStr> = filters
-                .iter()
-                .flatten()
-                .map(|(column_name, _, _)| column_name)
-                .filter(|column_name| {
-                    let column_name: &'_ str = column_name.as_ref();
-                    !column_names.contains(column_name)
-                })
-                .collect();
-            if !unknown_columns.is_empty() {
-                return Err(PyValueError::new_err(format!(
-                    "Filters include columns that are not in table schema: {unknown_columns:?}"
-                )));
-            }
-        }
 
         let filter = self.resolve_files_predicate(file_pruning_predicate)?;
 
@@ -2466,17 +2422,6 @@ fn set_writer_properties(writer_properties: PyWriterProperties) -> DeltaResult<W
 }
 
 /// Translate DNF filter tuples into a kernel predicate.
-fn kernel_dnf_predicate(
-    dnf: &[PyFilterConjunction],
-    table_schema: &delta_kernel::schema::StructType,
-) -> Result<delta_kernel::expressions::Predicate, DeltaTableError> {
-    let dnf: Vec<Vec<FilterLiteral<'_>>> = dnf
-        .iter()
-        .map(|conjunction| convert_partition_filters(conjunction))
-        .collect::<Result<_, _>>()?;
-    dnf_to_kernel_predicate(&dnf, table_schema)
-}
-
 /// Parse raw `(column, op, value)` tuples into typed filter literals borrowing
 /// from the Python-backed strings.
 fn convert_partition_filters(

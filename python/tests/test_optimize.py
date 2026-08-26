@@ -416,9 +416,7 @@ def test_zorder_with_space_partition(tmp_path: pathlib.Path):
     test_table = DeltaTable(tmp_path)
 
     # retrieve by partition works fine
-    partitioned_df = test_table.to_pandas(
-        partitions=[("country", "=", "United States")],
-    )
+    partitioned_df = test_table.to_pandas(filters="country = 'United States'")
     _ = partitioned_df
 
     test_table.optimize.z_order(columns=["user"])

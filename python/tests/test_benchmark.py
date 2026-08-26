@@ -89,13 +89,11 @@ def test_benchmark_read(benchmark, sample_table: Table, tmp_path: Path):
 @pytest.mark.benchmark(group="read")
 def test_benchmark_read_pyarrow(benchmark, sample_table: Table, tmp_path: Path):
     import pyarrow as pa
-    import pyarrow.fs as pa_fs
 
     write_deltalake(str(tmp_path), sample_table)
     dt = DeltaTable(str(tmp_path))
 
-    fs = pa_fs.SubTreeFileSystem(str(tmp_path), pa_fs.LocalFileSystem())
-    result = benchmark(dt.to_pyarrow_table, filesystem=fs)
+    result = benchmark(dt.to_pyarrow_table)
     assert result.sort_by("i") == pa.table(sample_table)
 
 
