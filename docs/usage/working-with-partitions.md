@@ -38,14 +38,14 @@ tmp/partitioned-table/
 
 ### Filtering by partition columns
 
-Because partition columns are part of the storage path, queries that filter on those columns can skip reading unneeded partitions. You can specify partition filters when reading data with [DeltaTable.to_pandas()](../api/delta_table/index.md#deltalake.DeltaTable.to_pandas).
+Because partition columns are part of the storage path, queries that filter on those columns can skip reading unneeded partitions. You can filter on partition columns when reading data with [DeltaTable.to_pandas()](../api/delta_table/index.md#deltalake.DeltaTable.to_pandas).
 
 In this example we restrict our query to the `country="US"` partition.
 
 ```python
 dt = DeltaTable("tmp/partitioned-table")
 
-pdf = dt.to_pandas(filters=[("country", "=", "US")])
+pdf = dt.to_pandas(filters="country = 'US'")
 print(pdf)
 ```
 
@@ -55,19 +55,16 @@ print(pdf)
 1    2      b      US
 ```
 
-A flat list of filter tuples is a conjunction: every filter must hold. To
-combine partitions with OR, pass a list of lists, an OR across the inner AND
-groups:
+`filters` is any SQL predicate, so partitions combine with `OR` and `IN`:
 
 ```python
-pdf = dt.to_pandas(filters=[[("country", "=", "US")], [("country", "=", "CA")]])
+pdf = dt.to_pandas(filters="country = 'US' OR country = 'CA'")
 ```
 
-To prune the file list itself, without reading data, use
+The same predicates work as `file_pruning_predicate` on
 [DeltaTable.file_uris()](../api/delta_table/index.md#deltalake.DeltaTable.file_uris)
-or [DeltaTable.partitions()](../api/delta_table/index.md#deltalake.DeltaTable.partitions)
-with `file_pruning_predicate`, which takes the same tuple filters or a SQL
-string and may reference non-partition columns as well. See
+and [DeltaTable.partitions()](../api/delta_table/index.md#deltalake.DeltaTable.partitions),
+and may reference non-partition columns as well -- see
 [Querying Delta Tables](querying-delta-tables.md#selecting-files-with-a-pruning-predicate)
 for the pruning semantics.
 

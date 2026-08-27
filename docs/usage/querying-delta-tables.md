@@ -13,7 +13,12 @@ also saves memory. Finally, some methods allow reading tables
 batch-by-batch, allowing you to process the whole table while only
 having a portion loaded at any given time.
 
-To load into Pandas or a PyArrow table use the `DeltaTable.to_pandas` and `DeltaTable.to_pyarrow_table` methods, respectively. Both of these support filtering partitions and selecting particular columns.
+To load into Pandas or a PyArrow table use the `DeltaTable.to_pandas` and
+`DeltaTable.to_pyarrow_table` methods, respectively. Both read with the
+built-in DataFusion engine: `filters` is a SQL predicate returning exactly
+the matching rows, with files pruned from the predicate automatically. Tables
+using column mapping or deletion vectors are supported. Row order follows
+query execution and is not guaranteed.
 
 ``` python
 >>> from deltalake import DeltaTable
@@ -23,79 +28,28 @@ value: string
 year: string
 month: string
 day: string
->>> dt.to_pandas(filters=[("year", "=", "2021")], columns=["value"])
+>>> dt.to_pandas(filters="year = '2021'", columns=["value"]).sort_values("value")
       value
-0     6
-1     7
-2     5
-3     4
->>> dt.to_pyarrow_table(filters=[("year", "=", "2021")], columns=["value"])
+0     4
+1     5
+2     6
+3     7
+>>> dt.to_pyarrow_table(filters="year = '2021'", columns=["value"])
 pyarrow.Table
 value: string
 ```
 
-## Choosing an engine
-
-`to_pyarrow_table` and `to_pandas` take an `engine` argument: `"pyarrow"`
-(the deprecated default) scans through a PyArrow dataset, `"datafusion"`
-reads with the built-in DataFusion engine. The datafusion engine also reads
-tables the pyarrow engine cannot (column mapping, deletion vectors), prunes
-files automatically from `filters`, and streams internally instead of
-materializing dataset fragments.
-
-``` python
->>> dt.to_pandas(engine="datafusion", filters=[("year", "=", "2021")], columns=["value"])
->>> dt.to_pandas(engine="datafusion", filters="year = '2021'", columns=["value"])
-```
-
-Under the datafusion engine, `filters` also accepts a SQL predicate string,
-passed to the engine as written; tuple filters are sugar compiled to the same
-SQL semantics.
-
-The engines agree on tuple filters in the common cases but differ where
-PyArrow and SQL semantics genuinely part ways. Migrating code should account
-for:
-
-- `("col", "not in", [...])` follows SQL three-valued logic: rows where
-  `col` is NULL do not match. The pyarrow engine keeps them.
-- `("col", "=", None)` matches NULL rows, consistent with the tuple-filter
-  tradition of the listing APIs. The pyarrow engine matches nothing.
-- Duplicate names in `columns=` are an error; the pyarrow engine returns the
-  column twice.
-- Row order follows query execution and is not deterministic across calls.
-- `filesystem=`, `pyarrow.dataset.Expression` filters, and the deprecated
-  `partitions` argument are pyarrow-engine concepts and are rejected;
-  the datafusion engine prunes files from `filters` on its own.
-
-These divergences are pinned by tests in `python/tests/test_engines.py`. The
-pyarrow engine is deprecated wholesale: any call that resolves to it warns,
-and it will be removed in a future release.
-
 ## Selecting files with a pruning predicate
 
-`file_pruning_predicate` selects which files a table's log lists, before any
-data is read. It takes either a SQL string or tuple filters. A flat list of
-tuples is a conjunction (AND); a list of such lists is an OR across the inner
-AND groups:
+The file listing APIs (`file_uris`, `partitions`) and `to_pyarrow_dataset`
+take a `file_pruning_predicate`, a SQL predicate that selects which files are
+read, before any data is scanned:
 
 ``` python
->>> # SQL string
 >>> dt.file_uris(file_pruning_predicate="(year = 2020 AND month = 2) OR (year = 2021 AND month = 12)")
->>> # flat list of tuples: a single conjunction, year = 2020 AND month = 2
->>> dt.file_uris(file_pruning_predicate=[("year", "=", "2020"), ("month", "=", "2")])
->>> # list of lists: OR across the inner AND groups
->>> dt.file_uris(
-...     file_pruning_predicate=[
-...         [("year", "=", "2020"), ("month", "=", "2")],
-...         [("year", "=", "2021"), ("month", "=", "12")],
-...     ],
-... )
 ```
 
-The parameter is accepted on `file_uris`, `partitions`, and
-`to_pyarrow_dataset`. The older `partitions` and `partition_filters`
-parameters on these methods still work but are deprecated in its favor. The
-predicate may reference any column, not just partition columns:
+The predicate may reference any column, not just partition columns:
 
 - **Partition columns** prune exactly: every returned file matches the
   predicate, and only matching files are returned.
@@ -109,22 +63,11 @@ predicate may reference any column, not just partition columns:
   [Delta Lake File Skipping](../how-delta-lake-works/delta-lake-file-skipping.md)
   for how to lay out tables so predicates prune well.
 
-As the name says, the predicate prunes files, not rows. On `to_pandas` and
-`to_pyarrow_table` there is no pruning parameter: `filters` prunes files just
-as effectively through the per-fragment statistics and then filters the
-surviving rows exactly. Both methods are thin wrappers over
-`to_pyarrow_dataset`, so to prune during log replay instead, before any
-per-file fragment setup (which can matter on tables with very large file
-counts), unroll the chain:
+As the name says, the predicate prunes files, not rows. The dataframe methods
+and `DeltaTable.scan` instead take a row predicate and return exact rows,
+pruning files from it automatically.
 
-``` python
->>> dt.to_pandas(filters=[("value", ">=", "5")])
->>> # unrolled: prune files first, then read; whole surviving files come
->>> # back unless you also pass a row filter to to_table
->>> dt.to_pyarrow_dataset(file_pruning_predicate="value >= '5'").to_table().to_pandas()
-```
-
-The full syntax for both forms is documented on
+The full syntax is documented on
 [`DeltaTable.file_uris`](../api/delta_table/index.md).
 
 ## Lazy reads with the built-in engine

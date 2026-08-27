@@ -3173,7 +3173,7 @@ def test_overwrite_with_partitions(tmp_path: pathlib.Path) -> None:
     write_parquet(data, new_file_path)
 
     action = AddAction(
-        "/ds=2026-01-01/foo.parquet",
+        "ds=2026-01-01/foo.parquet",
         new_file_path.stat().st_size,
         {"ds": "2026-01-01"},
         0,
