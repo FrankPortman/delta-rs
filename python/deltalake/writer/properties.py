@@ -26,7 +26,7 @@ class Compression(Enum):
     def get_level_range(self) -> tuple[int, int]:
         if self == Compression.GZIP:
             MIN_LEVEL = 0
-            MAX_LEVEL = 10
+            MAX_LEVEL = 9
         elif self == Compression.BROTLI:
             MIN_LEVEL = 0
             MAX_LEVEL = 11
@@ -101,7 +101,7 @@ class BloomFilterProperties:
             fpp: The false positive probability for the bloom filter. Must be between 0 and 1 exclusive.
             ndv: The number of distinct values for the bloom filter.
         """
-        if fpp is not None and (fpp <= 0 or fpp >= 1):
+        if fpp is not None and not 0 < fpp < 1:
             raise ValueError("fpp must be between 0 and 1 exclusive")
         self.set_bloom_filter_enabled = set_bloom_filter_enabled
         self.fpp = fpp
@@ -172,6 +172,7 @@ class WriterProperties:
         statistics_truncate_length: int | None = None,
         default_column_properties: ColumnProperties | None = None,
         column_properties: dict[str, ColumnProperties] | None = None,
+        writer_version: Literal["PARQUET_1_0", "PARQUET_2_0"] | None = None,
     ) -> None:
         """Create a Writer Properties instance for the Rust parquet writer:
 
@@ -183,12 +184,14 @@ class WriterProperties:
             max_row_group_size: Max number of rows in row group.
             compression: compression type.
             compression_level: If none and compression has a level, the default level will be used, only relevant for
-                GZIP: levels (1-9),
+                GZIP: levels (0-9),
                 BROTLI: levels (1-11),
                 ZSTD: levels (1-22),
             statistics_truncate_length: maximum length of truncated min/max values in statistics.
             default_column_properties: Default Column Properties for the Rust parquet writer.
             column_properties: Column Properties for the Rust parquet writer.
+            writer_version: Parquet writer version, selecting the DataPage format. Either PARQUET_1_0
+                (DataPage V1, the default) or PARQUET_2_0 (DataPage V2).
         """
         self.data_page_size_limit = data_page_size_limit
         self.dictionary_page_size_limit = dictionary_page_size_limit
@@ -199,6 +202,7 @@ class WriterProperties:
         self.statistics_truncate_length = statistics_truncate_length
         self.default_column_properties = default_column_properties
         self.column_properties = column_properties
+        self.writer_version = writer_version
 
         if compression_level is not None and compression is None:
             raise ValueError(
@@ -232,6 +236,8 @@ class WriterProperties:
         return (
             f"WriterProperties(data_page_size_limit: {self.data_page_size_limit}, dictionary_page_size_limit: {self.dictionary_page_size_limit}, "
             f"data_page_row_count_limit: {self.data_page_row_count_limit}, write_batch_size: {self.write_batch_size}, "
-            f"max_row_group_size: {self.max_row_group_size}, compression: {self.compression}, statistics_truncate_length: {self.statistics_truncate_length},"
-            f"default_column_properties: {self.default_column_properties}, column_properties: {column_properties_str})"
+            f"max_row_group_size: {self.max_row_group_size}, "
+            f"compression: {self.compression}, statistics_truncate_length: {self.statistics_truncate_length}, "
+            f"writer_version: {self.writer_version}, default_column_properties: {self.default_column_properties}, "
+            f"column_properties: {column_properties_str})"
         )

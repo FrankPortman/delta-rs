@@ -6,6 +6,7 @@ import pytest
 from arro3.core import Array, DataType, Field, Table
 
 from deltalake import CommitProperties, write_deltalake
+from deltalake.query import QueryBuilder
 from deltalake.table import DeltaTable
 
 if TYPE_CHECKING:
@@ -31,7 +32,7 @@ def test_delete_no_predicates(existing_sample_table: DeltaTable):
     commit_properties = CommitProperties(custom_metadata={"userName": "John Doe"})
     existing_sample_table.delete(commit_properties=commit_properties)
 
-    last_action = existing_sample_table.history(1)[0]
+    last_action = next(existing_sample_table.history(1))
     assert last_action["operation"] == "DELETE"
     assert existing_sample_table.version() == old_version + 1
     assert last_action["userName"] == "John Doe"
@@ -59,7 +60,7 @@ def test_delete_a_partition(tmp_path: pathlib.Path, sample_data_pyarrow: "pa.Tab
 
     dt.delete(predicate="bool = true")
 
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
     assert last_action["operation"] == "DELETE"
     assert dt.version() == old_version + 1
 
@@ -132,7 +133,7 @@ def test_delete_some_rows(existing_table: DeltaTable):
 
     existing_table.delete(predicate="utf8 in ('0', '1')")
 
-    last_action = existing_table.history(1)[0]
+    last_action = next(existing_table.history(1))
     assert last_action["operation"] == "DELETE"
     assert existing_table.version() == old_version + 1
 
@@ -198,3 +199,96 @@ def test_delete_stats_columns_stats_provided(tmp_path: pathlib.Path):
 
     with pytest.raises(Exception):
         get_value("null_count.bar")
+
+
+@pytest.mark.pandas
+def test_delete_concurrent_with_non_overlapping_append(tmp_path: pathlib.Path):
+    """A delete must not report an error for a commit that succeeded.
+
+    Regression test for https://github.com/delta-io/delta-rs/issues/2509.
+    """
+    import pandas as pd
+
+    df = pd.DataFrame.from_dict({"k": [1], "v": [1]})
+    write_deltalake(tmp_path, df, mode="overwrite")
+
+    # Read the table before the append, so that the delete below is concurrent.
+    table_2 = DeltaTable(tmp_path)
+
+    data_1 = pd.DataFrame.from_dict({"k": [3], "v": [-3]})
+    write_deltalake(tmp_path, data_1, mode="append")
+
+    table_2.delete("k = 1")
+
+    assert table_2.version() == 2
+    assert next(table_2.history(1))["operation"] == "DELETE"
+
+    from deltalake.query import QueryBuilder
+
+    expected = Table.from_pydict(
+        {
+            "k": Array([3], Field("k", type=DataType.int64(), nullable=True)),
+            "v": Array([-3], Field("v", type=DataType.int64(), nullable=True)),
+        }
+    )
+    result = (
+        QueryBuilder()
+        .register("tbl", DeltaTable(tmp_path))
+        .execute("select k, v from tbl")
+        .read_all()
+    )
+    assert result == expected
+
+
+def _write_partitioned_table(path: pathlib.Path) -> None:
+    write_deltalake(
+        path,
+        Table(
+            {
+                "id": Array(
+                    [0, 1, 2, 3], type=Field("id", DataType.int64(), nullable=True)
+                ),
+                "x": Array(
+                    [0, 1, 2, None], type=Field("x", DataType.int64(), nullable=True)
+                ),
+                "p": Array(
+                    [0, 1, None, 2], type=Field("p", DataType.int32(), nullable=True)
+                ),
+                "q": Array(
+                    ["a", "b", None, "c"],
+                    type=Field("q", DataType.string(), nullable=True),
+                ),
+            }
+        ),
+        partition_by=["p", "q"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("predicate", "expected_remaining"),
+    [
+        ("p + 1 = 2", [0, 2, 3]),
+        ("CASE WHEN p = 1 THEN true ELSE false END", [0, 2, 3]),
+        ("NOT coalesce(q > 'a', false)", [1, 3]),
+        ("x = NULL", [0, 1, 2, 3]),
+        ("p = 1 AND x = NULL", [0, 1, 2, 3]),
+        ("p = 1", [0, 2, 3]),
+        ("p IS NULL", [0, 1, 3]),
+    ],
+)
+def test_delete_partition_predicate_follows_sql_semantics(
+    tmp_path: pathlib.Path, predicate: str, expected_remaining: list[int]
+):
+    _write_partitioned_table(tmp_path)
+
+    metrics = DeltaTable(tmp_path).delete(predicate)
+
+    remaining = (
+        QueryBuilder()
+        .register("tbl", DeltaTable(tmp_path))
+        .execute("select id from tbl")
+        .read_all()["id"]
+        .to_pylist()
+    )
+    assert sorted(remaining) == expected_remaining
+    assert metrics["num_deleted_rows"] == 4 - len(expected_remaining)

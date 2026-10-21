@@ -73,11 +73,15 @@ def test_stats_usage_3201(tmp_path):
 
 
 @pytest.mark.pyarrow
-@pytest.mark.parametrize("use_stats_struct", (True, False))
-def test_microsecond_truncation_parquet_stats(tmp_path, use_stats_struct):
+@pytest.mark.parametrize(
+    "use_checkpoint,use_stats_struct", [(True, False), (True, True), (False, False)]
+)
+def test_microsecond_truncation_parquet_stats(
+    tmp_path, use_checkpoint, use_stats_struct
+):
     import pyarrow as pa
 
-    """In checkpoints the min,max value gets truncated to milliseconds precision.
+    """In checkpoints and JSON log files the min,max value gets truncated to milliseconds precision.
     For min values this is not an issue, but for max values we need to round upwards.
 
     This checks whether we can still read tables with truncated timestamp stats.
@@ -127,10 +131,11 @@ def test_microsecond_truncation_parquet_stats(tmp_path, use_stats_struct):
     )
     assert batch1 == result
 
-    dt.optimize.compact()
-    dt.create_checkpoint()
+    if use_checkpoint:
+        dt.optimize.compact()
+        dt.create_checkpoint()
 
-    result = dt.to_pyarrow_table(
+    result_le = dt.to_pyarrow_table(
         filters=[
             (
                 "dt",
@@ -139,7 +144,18 @@ def test_microsecond_truncation_parquet_stats(tmp_path, use_stats_struct):
             ),
         ]
     )
-    assert batch1 == result
+    assert batch1 == result_le
+
+    result_gt = dt.to_pyarrow_table(
+        filters=[
+            (
+                "dt",
+                ">",
+                datetime(2023, 3, 30, 0, 0, 0, 0, tzinfo=timezone.utc),
+            ),
+        ]
+    )
+    assert batch2 == result_gt
 
 
 @pytest.mark.polars
@@ -216,3 +232,30 @@ def test_struct_stats_3172(tmp_path: pathlib.Path) -> None:
     actions = dt.get_add_actions()
     min_stats = actions["min"][0].as_py()
     assert "year" in min_stats
+
+
+@pytest.mark.pyarrow
+def test_stats_columns_after_excluded_struct(tmp_path: pathlib.Path) -> None:
+    """
+    Columns listed in `delta.dataSkippingStatsColumns` that come after a struct
+    with no fields with stats must still have their stats parsed from the log.
+    """
+    import pyarrow as pa
+
+    data = pa.table(
+        {
+            "a": pa.array([1, 2], pa.int64()),
+            "st": pa.array([{"x": 1}, {"x": 2}], pa.struct([("x", pa.int64())])),
+            "b": pa.array([3, 4], pa.int64()),
+        }
+    )
+    write_deltalake(
+        tmp_path,
+        data,
+        configuration={"delta.dataSkippingStatsColumns": "a,b"},
+    )
+
+    actions = DeltaTable(tmp_path).get_add_actions()
+    assert actions["min"][0].as_py() == {"a": 1, "b": 3}
+    assert actions["max"][0].as_py() == {"a": 2, "b": 4}
+    assert actions["null_count"][0].as_py() == {"a": 0, "b": 0}

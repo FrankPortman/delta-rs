@@ -67,7 +67,7 @@ def test_merge_when_matched_delete_wo_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert last_action["userName"] == "John Doe"
@@ -143,7 +143,7 @@ def test_merge_when_matched_delete_with_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -210,7 +210,7 @@ def test_merge_when_matched_update_wo_predicate(
         .read_all()
     )
 
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -523,7 +523,7 @@ def test_merge_when_matched_update_wo_predicate_with_schema_evolution(
         .read_all()
     )
 
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result.schema == expected.schema
@@ -600,7 +600,7 @@ def test_merge_when_matched_update_wo_predicate_and_insert_with_schema_evolution
         .read_all()
     )
 
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result.schema == expected.schema
@@ -675,7 +675,7 @@ def test_merge_when_matched_update_all_wo_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -748,7 +748,7 @@ def test_merge_when_matched_update_all_with_exclude(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -820,7 +820,7 @@ def test_merge_when_matched_update_with_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -897,7 +897,7 @@ def test_merge_when_not_matched_insert_wo_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -975,7 +975,7 @@ def test_merge_when_not_matched_insert_with_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -1061,7 +1061,7 @@ def test_merge_when_not_matched_insert_with_predicate_schema_evolution(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result.schema == expected.schema
@@ -1134,7 +1134,7 @@ def test_merge_when_not_matched_insert_all_with_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -1204,7 +1204,7 @@ def test_merge_when_not_matched_insert_all_with_exclude(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -1281,7 +1281,7 @@ def test_merge_when_not_matched_insert_all_with_exclude_and_with_schema_evo(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result.schema == expected.schema
@@ -1354,7 +1354,7 @@ def test_merge_when_not_matched_insert_all_with_predicate_special_column_names(
         .execute("select * from tbl order by `1id` asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -1428,7 +1428,7 @@ def test_merge_when_not_matched_by_source_update_wo_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -1503,7 +1503,7 @@ def test_merge_when_not_matched_by_source_update_with_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -1573,7 +1573,7 @@ def test_merge_when_not_matched_by_source_delete_with_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -1635,7 +1635,7 @@ def test_merge_when_not_matched_by_source_delete_wo_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -1711,7 +1711,7 @@ def test_merge_multiple_when_matched_update_with_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -1785,7 +1785,7 @@ def test_merge_multiple_when_matched_update_all_with_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -1871,7 +1871,7 @@ def test_merge_multiple_when_not_matched_insert_with_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -1947,7 +1947,7 @@ def test_merge_multiple_when_matched_delete_with_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -2028,7 +2028,7 @@ def test_merge_multiple_when_not_matched_by_source_update_wo_predicate(
         .execute("select * from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -2071,18 +2071,15 @@ def test_merge_date_partitioned_2344(tmp_path: pathlib.Path, streaming: bool):
     ).when_matched_update_all().when_not_matched_insert_all().execute()
 
     result = dt.to_pyarrow_table()
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
-    if not streaming:
-        assert (
-            last_action["operationParameters"].get("predicate")
-            == "date = '2022-02-01'::date"
-        )
-    else:
-        # In streaming mode we don't use aggregated stats of the source in the predicate
-        assert last_action["operationParameters"].get("predicate") is None
+    # A streamed source records the predicate that it builds while it is read.
+    assert (
+        last_action["operationParameters"].get("predicate")
+        == "date = '2022-02-01'::date"
+    )
 
 
 @pytest.mark.pyarrow
@@ -2140,7 +2137,7 @@ def test_merge_timestamps_partitioned_2344(tmp_path: pathlib.Path, timezone, pre
     ).when_matched_update_all().when_not_matched_insert_all().execute()
 
     result = dt.to_pyarrow_table()
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == data
@@ -2518,7 +2515,7 @@ def test_merge_preserves_casing_in_quoted_identifiers(
         .read_all()
     )
 
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -2559,7 +2556,7 @@ def test_merge_camelcase_non_nullable_column_4082(tmp_path: pathlib.Path):
         .execute()
     )
 
-    assert dt.history(1)[0]["operation"] == "MERGE"
+    assert next(dt.history(1))["operation"] == "MERGE"
 
     result = QueryBuilder().register("tbl", dt).execute("select * from tbl").read_all()
     assert result["submittedAt"].to_pylist() == [123]
@@ -2618,7 +2615,7 @@ def test_merge_non_nullable_column_4527(tmp_path: pathlib.Path):
         .execute()
     )
 
-    assert dt.history(1)[0]["operation"] == "MERGE"
+    assert next(dt.history(1))["operation"] == "MERGE"
 
     result = (
         QueryBuilder()
@@ -2753,7 +2750,7 @@ def test_merge_isin_partition_pruning(tmp_path: pathlib.Path, streaming: bool):
         .execute("select id, partition, sold from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -2843,7 +2840,7 @@ def test_merge_isin_string_partition_pruning(tmp_path: pathlib.Path, streaming: 
         .execute("select id, date_part, sold from tbl order by id asc")
         .read_all()
     )
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert result == expected
@@ -2885,7 +2882,7 @@ def test_cdc_merge_planning_union_2908(tmp_path, streaming: bool):
         streamed_exec=streaming,
     ).when_not_matched_insert_all().execute()
 
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "MERGE"
     assert dt.version() == 1
@@ -2969,37 +2966,6 @@ def _merge_with_type_mismatch_actions(merger, action_style: str):
     return merger.when_matched_update(
         {"value": "source.value"}
     ).when_not_matched_insert({"id": "source.id", "value": "source.value"})
-
-
-@pytest.mark.pyarrow
-def test_merge_from_without_files_table_preserves_state(tmp_path: pathlib.Path):
-    import pyarrow as pa
-
-    target = pa.table({"id": [1, 2], "value": ["a", "b"]})
-    source = pa.table({"id": [2, 3], "value": ["bb", "c"]})
-    write_deltalake(tmp_path, target)
-
-    dt = DeltaTable(tmp_path, without_files=True)
-    metrics = (
-        dt.merge(
-            source=source,
-            predicate="target.id = source.id",
-            source_alias="source",
-            target_alias="target",
-        )
-        .when_matched_update({"value": "source.value"})
-        .when_not_matched_insert({"id": "source.id", "value": "source.value"})
-        .execute()
-    )
-
-    assert int(metrics["num_target_rows_updated"]) == 1
-    assert int(metrics["num_target_rows_inserted"]) == 1
-
-    result = DeltaTable(tmp_path).to_pyarrow_table().sort_by("id")
-    assert result["value"].to_pylist() == ["a", "bb", "c"]
-
-    with pytest.raises(DeltaError, match="Table is instantiated without files\\."):
-        dt.get_add_actions(flatten=True)
 
 
 @pytest.mark.pyarrow
@@ -3355,6 +3321,51 @@ def test_merge_schema_safe_cast_existing_column_failed_cast_becomes_null(
 
 
 @pytest.mark.pyarrow
+@pytest.mark.parametrize("error_on_type_mismatch", (True, False))
+def test_merge_schema_struct_added_field(
+    tmp_path: pathlib.Path, error_on_type_mismatch: bool
+):
+    import pyarrow as pa
+
+    old = pa.struct([("x", pa.int64())])
+    new = pa.struct([("x", pa.int64()), ("y", pa.string())])
+    target = pa.table({"id": [1, 2], "s": pa.array([{"x": 1}, {"x": 2}], type=old)})
+    source = pa.table({"id": [1], "s": pa.array([{"x": 9, "y": "a"}], type=new)})
+    write_deltalake(
+        tmp_path, target, configuration={"delta.enableChangeDataFeed": "true"}
+    )
+
+    dt = DeltaTable(tmp_path)
+    (
+        dt.merge(
+            source=source,
+            predicate="t.id = s.id",
+            source_alias="s",
+            target_alias="t",
+            merge_schema=True,
+            error_on_type_mismatch=error_on_type_mismatch,
+        )
+        .when_matched_update_all()
+        .execute()
+    )
+
+    result = dt.to_pyarrow_table().sort_by([("id", "ascending")]).to_pydict()
+    assert result == {
+        "id": [1, 2],
+        "s": [{"x": 9, "y": "a"}, {"x": 2, "y": None}],
+    }
+
+    changes = dt.load_cdf(starting_version=1).read_all()
+    assert sorted(
+        zip(changes["_change_type"].to_pylist(), changes["s"].to_pylist()),
+        key=lambda c: c[0],
+    ) == [
+        ("update_postimage", {"x": 9, "y": "a"}),
+        ("update_preimage", {"x": 1, "y": None}),
+    ]
+
+
+@pytest.mark.pyarrow
 def test_merge_on_decimal_3033(tmp_path):
     import pyarrow as pa
 
@@ -3394,11 +3405,11 @@ def test_merge_on_decimal_3033(tmp_path):
         streamed_exec=False,  # only with streamed execution off can we use stats to create a pruning predicate
     ).when_matched_update_all().when_not_matched_insert_all().execute()
 
-    string_predicate = dt.history(1)[0]["operationParameters"]["predicate"]
+    string_predicate = next(dt.history(1))["operationParameters"]["predicate"]
 
     assert (
         string_predicate
-        == "timestamp = arrow_cast('2024-03-20T12:30:00.000000', 'Timestamp(Microsecond, None)') AND altitude = '1505'::decimal(6, 1)"
+        == "timestamp = arrow_cast('2024-03-20T12:30:00.000000', 'Timestamp(Microsecond, None)') AND altitude = '150.5'::decimal(6, 1)"
     )
 
 
@@ -3711,3 +3722,117 @@ def test_merge_type_mismatch_partition_pruning(tmp_path: pathlib.Path, streaming
         f"got {metrics['num_target_files_skipped_during_scan']}. "
         "This suggests partition pruning is not working effectively with type mismatches."
     )
+
+
+@pytest.mark.pandas
+@pytest.mark.parametrize("streaming", (True, False))
+def test_merge_file_pruning_regression_3636(tmp_path: pathlib.Path, streaming: bool):
+    """
+    https://github.com/delta-io/delta-rs/issues/3636
+    """
+    import numpy as np
+    import pandas as pd
+    import pyarrow as pa
+
+    from deltalake import DeltaTable
+
+    # create table once
+    dt = DeltaTable.create(
+        tmp_path,
+        pa.schema(
+            [
+                pa.field("ts", pa.timestamp("us"), nullable=False),
+                pa.field("direction", pa.string(), nullable=False),  # S, W, N, E
+                pa.field("distance", pa.float64(), nullable=False),
+                pa.field("updated_on", pa.int64(), nullable=False),  # timestamp in ms
+                pa.field("date", pa.string(), nullable=False),
+            ]
+        ),
+        partition_by=["date"],
+        mode="ignore",
+    )
+
+    def mock_data(size: int):
+        tss = pd.date_range(start="2025-01-01", freq="2s", periods=size // 4)
+
+        init_upd_df = {
+            "ts": [*tss] * 4,
+            "direction": [i for i in ("S", "W", "N", "E") for _ in range(len(tss))],
+            "distance": np.random.randint(0, 10000, size=len(tss) * 4),
+            "updated_on": list(  # NumPy 1.x uses int32 for int on Windows.
+                (tss.floor("D") + pd.Timedelta(hours=25)).astype("int64") // 1000000
+            )
+            * 4,
+            "date": list(tss.strftime("%Y-%m-%d")) * 4,
+        }
+        return pd.DataFrame(init_upd_df)
+
+    # Let's prefill the table large enough to spread the results across
+    # multiple files
+    init_df = mock_data(500_000)
+
+    dt = DeltaTable(tmp_path)
+
+    dt.merge(
+        init_df,
+        predicate="s.date = t.date and s.ts = t.ts and s.direction = t.direction",
+        source_alias="s",
+        target_alias="t",
+    ).when_not_matched_insert_all().execute()
+
+    second_upd = mock_data(40)
+
+    dt = DeltaTable(tmp_path)
+
+    stats = (
+        dt.merge(
+            second_upd,
+            predicate="s.date = t.date and s.ts = t.ts and s.direction = t.direction",
+            source_alias="s",
+            target_alias="t",
+            streamed_exec=streaming,
+        )
+        .when_not_matched_insert_all()
+        .execute()
+    )
+
+    assert stats["num_target_files_scanned"] == 1
+
+
+@pytest.mark.pyarrow
+@pytest.mark.parametrize("cdf", (False, True))
+def test_merge_insert_predicate_skips_rejected_rows_4784(
+    tmp_path: pathlib.Path, cdf: bool
+):
+    # Regression test for https://github.com/delta-io/delta-rs/issues/4784
+    import pyarrow as pa
+
+    write_deltalake(
+        tmp_path,
+        pa.table({"id": pa.array([1], pa.int64()), "v": pa.array([10.0])}),
+        configuration={"delta.enableChangeDataFeed": "true"} if cdf else None,
+    )
+    # id 2 should be inserted; id 99 fails the insert predicate and must be ignored
+    source = pa.table(
+        {
+            "id": pa.array([2, 99], pa.int64()),
+            "v": pa.array([20.0, None]),
+            "op": pa.array(["insert", "skip"]),
+        }
+    )
+    (
+        DeltaTable(tmp_path)
+        .merge(
+            source=source,
+            predicate="t.id = s.id",
+            source_alias="s",
+            target_alias="t",
+        )
+        .when_not_matched_insert(
+            updates={"id": "s.id", "v": "s.v"}, predicate="s.op = 'insert'"
+        )
+        .execute()
+    )
+
+    result = DeltaTable(tmp_path).to_pyarrow_table().sort_by("id").to_pylist()
+    assert result == [{"id": 1, "v": 10.0}, {"id": 2, "v": 20.0}]

@@ -1,4 +1,6 @@
+import datetime
 import pathlib
+import time
 
 import pytest
 from arro3.core import Array, DataType, Table
@@ -75,7 +77,7 @@ def test_update_with_predicate(tmp_path: pathlib.Path, sample_table: Table):
     )
 
     result = QueryBuilder().register("tbl", dt).execute("select * from tbl").read_all()
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "UPDATE"
     assert last_action["userName"] == "John Doe"
@@ -115,7 +117,7 @@ def test_update_wo_predicate(tmp_path: pathlib.Path, sample_table: Table):
     dt.update(updates={"deleted": "True"})
 
     result = QueryBuilder().register("tbl", dt).execute("select * from tbl").read_all()
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "UPDATE"
     assert result == expected
@@ -171,7 +173,7 @@ def test_update_wo_predicate_multiple_updates(
     )
 
     result = QueryBuilder().register("tbl", dt).execute("select * from tbl").read_all()
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "UPDATE"
     assert result == expected
@@ -221,10 +223,62 @@ def test_update_with_predicate_and_new_values(
     )
 
     result = QueryBuilder().register("tbl", dt).execute("select * from tbl").read_all()
-    last_action = dt.history(1)[0]
+    last_action = next(dt.history(1))
 
     assert last_action["operation"] == "UPDATE"
     assert result == expected
+
+
+@pytest.mark.parametrize("value", ["Alice", "O'Reilly", "a' || 'b", ""])
+def test_update_new_values_preserves_strings(tmp_path, value):
+    data = Table(
+        {
+            "name": Array(
+                ["before"],
+                ArrowField("name", type=DataType.string(), nullable=True),
+            )
+        }
+    )
+    write_deltalake(tmp_path, data)
+    dt = DeltaTable(tmp_path)
+
+    dt.update(new_values={"name": value})
+
+    result = (
+        QueryBuilder().register("tbl", dt).execute("SELECT name FROm tbl").read_all()
+    )
+    assert result.column("name")[0].as_py() == value
+
+
+@pytest.mark.pyarrow
+@pytest.mark.parametrize("tz", ["UTC", "Asia/Seoul", "America/Los_Angeles"])
+def test_update_new_values_naive_datetime_is_utc(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, tz: str
+):
+    import pyarrow as pa
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is not available on this platform")
+
+    data = pa.table(
+        {
+            "ts": pa.array(
+                [datetime.datetime(2026, 1, 1)], type=pa.timestamp("us", "UTC")
+            )
+        }
+    )
+    write_deltalake(tmp_path, data)
+    dt = DeltaTable(tmp_path)
+
+    monkeypatch.setenv("TZ", tz)
+    time.tzset()
+
+    dt.update(new_values={"ts": datetime.datetime(2026, 6, 1, 12, 30)})
+
+    result = QueryBuilder().register("tbl", dt).execute("SELECT ts FROM tbl").read_all()
+    assert result.column("ts")[0].as_py() == datetime.datetime(
+        2026, 6, 1, 12, 30, tzinfo=datetime.timezone.utc
+    )
 
 
 def test_update_no_inputs(tmp_path: pathlib.Path, sample_table: Table):

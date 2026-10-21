@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import warnings
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -24,7 +25,6 @@ from arro3.core.types import (
 )
 
 from deltalake._internal import (
-    DeltaError,
     PyMergeBuilder,
     RawDeltaTable,
     TableFeatures,
@@ -51,6 +51,7 @@ if TYPE_CHECKING:
         AddAction,
         CommitProperties,
         PostCommitHookProperties,
+        RemoveAction,
     )
     from deltalake.writer.properties import WriterProperties
 
@@ -61,13 +62,19 @@ SUPPORTED_WRITER_FEATURES = {
     "appendOnly",
     "invariants",
     "timestampNtz",
+    "v2Checkpoint",
     "variantType",
     "variantType-preview",
 }
 
 MAX_SUPPORTED_READER_VERSION = 3
-NOT_SUPPORTED_READER_VERSION = 2
-SUPPORTED_READER_FEATURES = {"timestampNtz", "variantType", "variantType-preview"}
+NOT_SUPPORTED_READER_VERSION = -1
+SUPPORTED_READER_FEATURES = {
+    "timestampNtz",
+    "v2Checkpoint",
+    "variantType",
+    "variantType-preview",
+}
 
 FSCK_METRICS_FILES_REMOVED_LABEL = "files_removed"
 
@@ -113,6 +120,112 @@ def _encode_filter_conjunction(
             str_value = encode_partition_value(value)
         encoded.append((field, op, str_value))
     return encoded
+
+
+def _warn_pyarrow_engine(method: str) -> None:
+    warnings.warn(
+        f"The pyarrow engine of {method} is deprecated and will be removed in a "
+        'future release; pass engine="datafusion". The engines differ in edge '
+        'cases: see the "Choosing an engine" section of the Querying Delta '
+        "Tables docs before migrating.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+_SQL_FILTER_OPS = frozenset({"=", "==", "!=", "<", "<=", ">", ">=", "in", "not in"})
+
+
+def _sql_identifier(name: str) -> str:
+    """Double-quote an identifier so case survives and any name is legal."""
+    escaped = name.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def _sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    escaped = encode_partition_value(value).replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _sql_filter_literal(literal: FilterLiteralType) -> str:
+    """Render one (column, op, value) tuple with the engine's declared
+    semantics: `= None` is IS NULL, a None in an `in` list matches NULLs, and
+    `not in` keeps SQL three-valued logic."""
+    match literal:
+        case tuple((str() as column, str() as op, value)) if op in _SQL_FILTER_OPS:
+            pass
+        case tuple((_, _, _)):
+            raise ValueError(
+                f"invalid filter {literal!r}; expected a string column and an "
+                f"operator among =, !=, <, <=, >, >=, in, not in"
+            )
+        case _:
+            raise ValueError(f"filter must be a (column, op, value) tuple: {literal!r}")
+
+    ident = _sql_identifier(column)
+    match op, value:
+        case "not in", list() | tuple() | set() if not value:
+            return "TRUE"
+        case "not in", list() | tuple() | set():
+            return f"{ident} NOT IN ({', '.join(_sql_literal(v) for v in value)})"
+        case "in", list() | tuple() | set():
+            non_null = [v for v in value if v is not None]
+            has_null = len(non_null) != len(value)
+            in_clause = f"{ident} IN ({', '.join(_sql_literal(v) for v in non_null)})"
+            match non_null, has_null:
+                case [], False:
+                    return "FALSE"
+                case [], True:
+                    return f"{ident} IS NULL"
+                case _, False:
+                    return in_clause
+                case _:
+                    return f"({in_clause} OR {ident} IS NULL)"
+        case (("in" | "not in"), _):
+            raise ValueError(f"operator {op!r} takes a list of values: {literal!r}")
+        case _, list() | tuple() | set():
+            raise ValueError(f"operator {op!r} takes a single value: {literal!r}")
+        case (("=" | "=="), None):
+            return f"{ident} IS NULL"
+        case "!=", None:
+            return f"{ident} IS NOT NULL"
+        case _, None:
+            return f"{ident} {op} NULL"
+        case "==", _:
+            return f"{ident} = {_sql_literal(value)}"
+        case _:
+            return f"{ident} {op} {_sql_literal(value)}"
+
+
+def _filters_to_sql_predicate(filters: FilterType) -> str:
+    """Compile tuple filters to a DataFusion SQL predicate: a flat list is a
+    conjunction (AND), a list of lists an OR across parenthesized ANDs."""
+    conjunctions: FilterDNFType
+    if all(isinstance(conjunction, list) for conjunction in filters):
+        conjunctions = cast(FilterDNFType, filters)
+    elif all(isinstance(literal, tuple) for literal in filters):
+        conjunctions = [cast(FilterConjunctionType, filters)]
+    else:
+        raise ValueError(
+            "filters must be a list of (column, op, value) tuples (a conjunction), "
+            "or a list of such lists (an OR across conjunctions), not a mix of both"
+        )
+    parts = []
+    for conjunction in conjunctions:
+        if not conjunction:
+            raise ValueError(
+                "empty conjunction in filters; pass no filter to match all rows"
+            )
+        parts.append(" AND ".join(_sql_filter_literal(lit) for lit in conjunction))
+    if len(parts) == 1:
+        return parts[0]
+    return " OR ".join(f"({part})" for part in parts)
 
 
 class _KeywordArgDefault:
@@ -177,10 +290,66 @@ class Metadata:
         )
 
 
-class DeltaTableConfig(NamedTuple):
+class TableProperty(StrEnum):
+    """Delta table property keys.
+
+    Use these values as keys in the `configuration` argument to
+    [write_deltalake][deltalake.write_deltalake].
+
+    Example:
+        ```python
+        write_deltalake(
+            "path/to/table",
+            data,
+            configuration={TableProperty.APPEND_ONLY: "true"},
+        )
+        ```
+    """
+
+    APPEND_ONLY = "delta.appendOnly"
+    AUTO_OPTIMIZE_AUTO_COMPACT = "delta.autoOptimize.autoCompact"
+    AUTO_OPTIMIZE_OPTIMIZE_WRITE = "delta.autoOptimize.optimizeWrite"
+    CHECKPOINT_INTERVAL = "delta.checkpointInterval"
+    CHECKPOINT_WRITE_STATS_AS_JSON = "delta.checkpoint.writeStatsAsJson"
+    CHECKPOINT_WRITE_STATS_AS_STRUCT = "delta.checkpoint.writeStatsAsStruct"
+    # Deprecated: ignored since 1.0.0, checkpoint encoding is not configurable.
+    CHECKPOINT_USE_RUN_LENGTH_ENCODING = "delta-rs.checkpoint.useRunLengthEncoding"
+    CHECKPOINT_POLICY = "delta.checkpointPolicy"
+    COLUMN_MAPPING_MODE = "delta.columnMapping.mode"
+    DATA_SKIPPING_NUM_INDEXED_COLS = "delta.dataSkippingNumIndexedCols"
+    DATA_SKIPPING_STATS_COLUMNS = "delta.dataSkippingStatsColumns"
+    DELETED_FILE_RETENTION_DURATION = "delta.deletedFileRetentionDuration"
+    ENABLE_CHANGE_DATA_FEED = "delta.enableChangeDataFeed"
+    ENABLE_DELETION_VECTORS = "delta.enableDeletionVectors"
+    ISOLATION_LEVEL = "delta.isolationLevel"
+    LOG_RETENTION_DURATION = "delta.logRetentionDuration"
+    ENABLE_EXPIRED_LOG_CLEANUP = "delta.enableExpiredLogCleanup"
+    MIN_READER_VERSION = "delta.minReaderVersion"
+    MIN_WRITER_VERSION = "delta.minWriterVersion"
+    RANDOMIZE_FILE_PREFIXES = "delta.randomizeFilePrefixes"
+    RANDOM_PREFIX_LENGTH = "delta.randomPrefixLength"
+    SET_TRANSACTION_RETENTION_DURATION = "delta.setTransactionRetentionDuration"
+    TARGET_FILE_SIZE = "delta.targetFileSize"
+    TUNE_FILE_SIZES_FOR_REWRITES = "delta.tuneFileSizesForRewrites"
+
+
+class _DeltaTableConfigBase(NamedTuple):
     without_files: bool
     log_buffer_size: int
     skip_stats: bool = False
+
+
+class DeltaTableConfig(_DeltaTableConfigBase):
+    def __new__(
+        cls, without_files: bool, log_buffer_size: int, skip_stats: bool = False
+    ) -> "DeltaTableConfig":
+        """Create DeltaTableConfig with deprecation warning."""
+        warnings.warn(
+            "The DeltaTableConfig class is deprecated and will be removed in a future release. ",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return super().__new__(cls, without_files, log_buffer_size, skip_stats)
 
 
 class ProtocolVersions(NamedTuple):
@@ -212,37 +381,54 @@ class DeltaTable:
             table_uri: the path of the DeltaTable
             version: version of the DeltaTable
             storage_options: a dictionary of the options to use for the storage backend
-            without_files: If True, will load table without tracking files.
-                                Some append-only applications might have no need of tracking any files. So, the
-                                DeltaTable will be loaded with a significant memory reduction.
-            log_buffer_size: Number of files to buffer when reading the commit log. A positive integer.
-                                Setting a value greater than 1 results in concurrent calls to the storage api.
-                                This can decrease latency if there are many files in the log since the last checkpoint,
-                                but will also increase memory usage. Possible rate limits of the storage backend should
-                                also be considered for optimal performance. Defaults to 4 * number of cpus.
-            skip_stats: If True, skip parsing file statistics while opening the table.
-                                Use for maintenance and append workflows that do not need file pruning.
-                                Queries with predicates scan each file because the kernel disables statistics and
-                                partition pruning. Defaults to False.
+            without_files: Deprecated and ignored. Table loading materializes active-file metadata.
+            log_buffer_size: Deprecated and ignored. Log buffering is managed internally.
+            skip_stats: Deprecated and ignored. Table loading retains file statistics.
 
         """
+        if without_files:
+            warnings.warn(
+                "The 'without_files' parameter is deprecated and ignored. "
+                "Table loading materializes active-file metadata.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if log_buffer_size is not None:
+            warnings.warn(
+                "The 'log_buffer_size' parameter is deprecated and ignored. "
+                "Log buffering is managed internally.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if skip_stats:
+            warnings.warn(
+                "The 'skip_stats' parameter is deprecated and ignored. "
+                "Table loading retains file statistics.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         self._storage_options = storage_options
         self._table = RawDeltaTable(
             str(table_uri),
             version=version,
             storage_options=storage_options,
-            without_files=without_files,
-            log_buffer_size=log_buffer_size,
-            skip_stats=skip_stats,
         )
 
     @property
     def table_config(self) -> DeltaTableConfig:
+        warnings.warn(
+            "The 'table_config' property is deprecated and will be removed in a future release. "
+            "It reports effective defaults; deprecated constructor options are ignored.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return DeltaTableConfig(*self._table.table_config())
 
     @staticmethod
     def is_deltatable(
-        table_uri: str, storage_options: dict[str, str] | None = None
+        table_uri: str | Path | os.PathLike[str],
+        storage_options: dict[str, str] | None = None,
     ) -> bool:
         """
         Returns True if a Delta Table exists at specified path.
@@ -253,7 +439,7 @@ class DeltaTable:
             storage_options: a dictionary of the options to use for the
                 storage backend
         """
-        return RawDeltaTable.is_deltatable(table_uri, storage_options)
+        return RawDeltaTable.is_deltatable(str(table_uri), storage_options)
 
     @classmethod
     def create(
@@ -515,7 +701,7 @@ class DeltaTable:
             self._table.load_version(version)
         elif isinstance(version, datetime):
             if version.tzinfo is None:
-                version = version.astimezone(timezone.utc)
+                version = version.replace(tzinfo=timezone.utc)
             self._table.load_with_datetime(version.isoformat())
         elif isinstance(version, str):
             self._table.load_with_datetime(version)
@@ -677,26 +863,34 @@ class DeltaTable:
         """
         return self._table.generate()
 
-    def history(self, limit: int | None = None) -> list[dict[str, Any]]:
+    def history(self, limit: int | None = None) -> Iterator[dict[str, Any]]:
         """
         Run the history command on the DeltaTable.
         The operations are returned in reverse chronological order.
+
+        The commit infos are read lazily as the iterator is consumed, so stopping
+        early avoids reading the rest of the transaction log. The history is pinned
+        to the table state at the time of the call. Wrap the result in ``list(...)``
+        to materialize it.
 
         Args:
             limit: the commit info limit to return
 
         Returns:
-            list of the commit infos registered in the transaction log
+            iterator over the commit infos registered in the transaction log
         """
-        latest_version, commits = self._table.history(limit)
-        history = []
-        version = latest_version
-        for commit_info_raw in commits:
-            commit = json.loads(commit_info_raw)
-            commit["version"] = version
-            history.append(commit)
-            version -= 1
-        return history
+        commits = self._table.history(limit)
+        latest_version = commits.latest_version
+
+        def _iter() -> Iterator[dict[str, Any]]:
+            version = latest_version
+            for commit_info_raw in commits:
+                commit = json.loads(commit_info_raw)
+                commit["version"] = version
+                yield commit
+                version -= 1
+
+        return _iter()
 
     def count(self) -> int:
         """
@@ -705,21 +899,27 @@ class DeltaTable:
         This requires that add actions have been added to the Delta table with
         per-file statistics enabled. Because this is an optional field this
         "count" will be less than or equal to the true row count of the table.
+        Rows marked as deleted by deletion vectors are not counted.
         In order to get an exact number of rows a full table scan must happen
 
         Returns:
             The approximate number of rows for this specific table
         """
-        total_rows = 0
+        actions = self.get_add_actions(flatten=True)
+        num_records: list[int | None] = actions.column("num_records").to_pylist()
+        deleted_rows: list[int | None]
+        if "deletion_vector.cardinality" in actions.column_names:
+            deleted_rows = actions.column("deletion_vector.cardinality").to_pylist()
+        else:
+            deleted_rows = [None] * len(num_records)
 
-        for value in self.get_add_actions().column("num_records").to_pylist():
-            # Add action file statistics are optional and so while most modern
-            # tables are _likely_ to have this information it is not
-            # guaranteed.
-            if value is not None:
-                total_rows += value
-
-        return total_rows
+        # Add action file statistics are optional and so while most modern
+        # tables are _likely_ to have this information it is not guaranteed.
+        return sum(
+            records - (deleted or 0)
+            for records, deleted in zip(num_records, deleted_rows)
+            if records is not None
+        )
 
     def vacuum(
         self,
@@ -738,7 +938,11 @@ class DeltaTable:
         plus any files not mentioned in the logs (unless they start with underscore).
 
         Args:
-            retention_hours: the retention threshold in hours, if none then the value from `delta.deletedFileRetentionDuration` is used or default of 1 week otherwise.
+            retention_hours: the retention threshold in hours. If None, the value of the
+                `delta.deletedFileRetentionDuration` table property is used (default: 1 week).
+                Set the property when creating the table via the `configuration` argument of
+                `write_deltalake`, or on an existing table with
+                `dt.alter.set_table_properties({TableProperty.DELETED_FILE_RETENTION_DURATION: "interval 30 days"})`.
             dry_run: when activated, list only the files, delete otherwise
             enforce_retention_duration: when disabled, accepts retention hours smaller than the value from `delta.deletedFileRetentionDuration`.
             commit_properties: properties of the transaction commit. If None, default values are used.
@@ -814,6 +1018,7 @@ class DeltaTable:
     ) -> dict[str, Any]:
         """`UPDATE` records in the Delta Table that matches an optional predicate. Either updates or new_values needs
         to be passed for it to execute.
+        If a datetime object without a timezone is passed in `new_values`, the UTC timezone will be assumed.
 
         Args:
             updates: a mapping of column name to update SQL expression.
@@ -879,8 +1084,10 @@ class DeltaTable:
                 if isinstance(value, (int, float, bool, list)):
                     value = str(value)
                 elif isinstance(value, str):
-                    value = f"'{value}'"
+                    value = "'" + value.replace("'", "''") + "'"
                 elif isinstance(value, datetime):
+                    if value.tzinfo is None:
+                        value = value.replace(tzinfo=timezone.utc)
                     value = str(
                         int(value.timestamp() * 1000 * 1000)
                     )  # convert to microseconds
@@ -968,8 +1175,9 @@ class DeltaTable:
             merge_schema: Enable merge schema evolution for mismatch schema between source and target tables
             error_on_type_mismatch: specify if merge returns an error when update or insert expressions fail to cast to target column types :default = True
             writer_properties: Pass writer properties to the Rust parquet writer
-            streamed_exec: Will execute MERGE using a LazyMemoryExec plan, this improves memory pressure for large source tables. Enabling streamed_exec
-                implicitly disables source table stats to derive an early_pruning_predicate
+            streamed_exec: Will execute MERGE using a LazyMemoryExec plan, this improves memory pressure for large source tables. With streamed_exec,
+                the source is read once. The source statistics that skip target files are collected while the source is read, and are applied
+                before the target is read.
             max_spill_size: The maximum number of bytes allowed in memory before spilling to disk.
                 If not specified, uses DataFusion's default.
                 Set this to avoid OOM when merging into large tables with a source table which touches a large number of files.
@@ -1021,6 +1229,7 @@ class DeltaTable:
     ) -> dict[str, Any]:
         """
         Restores table to a given version or datetime. See also [``load_as_version``](#deltalake.DeltaTable.load_as_version).
+        If a datetime object without a timezone is passed, the UTC timezone will be assumed.
 
         Args:
             target: the expected version will restore, which represented by int, date str or datetime.
@@ -1040,6 +1249,8 @@ class DeltaTable:
             ```
         """
         if isinstance(target, datetime):
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
             metrics = self._table.restore(
                 target.isoformat(),
                 ignore_missing_files=ignore_missing_files,
@@ -1117,17 +1328,11 @@ class DeltaTable:
             raise ImportError(
                 "Pyarrow is required, install deltalake[pyarrow] for pyarrow read functionality."
             )
-        if not self._table.has_files():
-            raise DeltaError("Table is instantiated without files.")
-
         table_protocol = self.protocol()
-        if (
-            table_protocol.min_reader_version > MAX_SUPPORTED_READER_VERSION
-            or table_protocol.min_reader_version == NOT_SUPPORTED_READER_VERSION
-        ):
+        if table_protocol.min_reader_version > MAX_SUPPORTED_READER_VERSION:
             raise DeltaProtocolError(
-                f"The table's minimum reader version is {table_protocol.min_reader_version} "
-                f"but deltalake only supports version 1 or {MAX_SUPPORTED_READER_VERSION} "
+                f"The table's minimum reader version greater than the "
+                f"maximum supported version {MAX_SUPPORTED_READER_VERSION} "
                 f"with these reader features: {SUPPORTED_READER_FEATURES}"
             )
         if (
@@ -1143,7 +1348,14 @@ class DeltaTable:
                     "but these are not yet supported by the deltalake reader."
                 )
 
-        if (
+        # minReaderVersion 2 tables carry column mapping without a
+        # reader_features list, so the feature check alone misses them and the
+        # scanner reads logical column names against physical parquet columns,
+        # returning all nulls. Check the table configuration directly.
+        column_mapping_mode = self.metadata().configuration.get(
+            "delta.columnMapping.mode", "none"
+        )
+        if column_mapping_mode not in ("none",) or (
             table_protocol.reader_features
             and "columnMapping" in table_protocol.reader_features
         ):
@@ -1212,7 +1424,8 @@ class DeltaTable:
         partitions: FilterType | None = None,
         columns: list[str] | None = None,
         filesystem: str | pa_fs.FileSystem | None = None,
-        filters: FilterType | Expression | None = None,
+        filters: str | FilterType | Expression | None = None,
+        engine: Literal["pyarrow", "datafusion"] = "pyarrow",
     ) -> "pyarrow.Table":
         """
         Build a PyArrow Table using data from the DeltaTable.
@@ -1222,10 +1435,11 @@ class DeltaTable:
         files that cannot contain matching rows are never read, and the
         surviving rows are filtered exactly.
 
-        This method is a thin wrapper over `to_pyarrow_dataset`. The unrolled
-        chain is equivalent, and passing `file_pruning_predicate` there prunes
-        during log replay, before any per-file fragment setup, which can matter
-        on tables with very large file counts:
+        With `engine="pyarrow"` (the deprecated default), this method is a thin
+        wrapper over `to_pyarrow_dataset`. The unrolled chain is equivalent, and
+        passing `file_pruning_predicate` there prunes during log replay, before
+        any per-file fragment setup, which can matter on tables with very large
+        file counts:
 
         ```python
         dt.to_pyarrow_table(columns=cols, filters=[("year", "=", "2021")])
@@ -1237,12 +1451,50 @@ class DeltaTable:
         ).to_table(columns=cols)
         ```
 
+        With `engine="datafusion"`, the built-in engine reads the table instead;
+        it also reads tables the pyarrow engine cannot, such as those using
+        column mapping or deletion vectors. Row order is not guaranteed. The
+        engines differ in edge cases (NULL handling, duplicate projections); see
+        the "Choosing an engine" section of the Querying Delta Tables docs.
+
         Args:
             partitions: Deprecated. Use `filters`, or `to_pyarrow_dataset` with `file_pruning_predicate`
             columns: The columns to project. This can be a list of column names to include (order and duplicates will be preserved)
-            filesystem: A concrete implementation of the Pyarrow FileSystem or a fsspec-compatible interface. If None, the first file path will be used to determine the right FileSystem
-            filters: A disjunctive normal form (DNF) predicate for filtering rows, or directly a pyarrow.dataset.Expression
+            filesystem: A concrete implementation of the Pyarrow FileSystem or a fsspec-compatible interface. If None, the first file path will be used to determine the right FileSystem. `engine="pyarrow"` only
+            filters: A SQL predicate string (`engine="datafusion"` only) or a disjunctive normal form (DNF) tuple predicate for filtering rows. `engine="pyarrow"` also accepts a pyarrow.dataset.Expression
+            engine: The engine reading the table. The pyarrow engine is deprecated and will be removed in a future release
         """
+        match engine:
+            case "datafusion":
+                return self._to_pyarrow_table_datafusion(
+                    partitions=partitions,
+                    columns=columns,
+                    filesystem=filesystem,
+                    filters=filters,
+                )
+            case "pyarrow":
+                _warn_pyarrow_engine("to_pyarrow_table")
+                return self._to_pyarrow_table_pyarrow(
+                    partitions=partitions,
+                    columns=columns,
+                    filesystem=filesystem,
+                    filters=filters,
+                )
+            case _:
+                raise ValueError(
+                    f"unknown engine {engine!r}; expected 'pyarrow' or 'datafusion'"
+                )
+
+    def _to_pyarrow_table_pyarrow(
+        self,
+        *,
+        partitions: FilterType | None,
+        columns: list[str] | None,
+        filesystem: str | pa_fs.FileSystem | None,
+        filters: str | FilterType | Expression | None,
+    ) -> "pyarrow.Table":
+        if isinstance(filters, str):
+            raise ValueError('SQL string filters require engine="datafusion"')
         try:
             from pyarrow.parquet import filters_to_expression  # pyarrow >= 10.0.0
         except ImportError:
@@ -1254,7 +1506,7 @@ class DeltaTable:
             warnings.warn(
                 "`partitions` is deprecated; use `filters` instead",
                 DeprecationWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
         if filters is not None:
             filters = filters_to_expression(filters)
@@ -1263,13 +1515,59 @@ class DeltaTable:
             filesystem=filesystem,
         ).to_table(columns=columns, filter=filters)
 
+    def _to_pyarrow_table_datafusion(
+        self,
+        *,
+        partitions: FilterType | None,
+        columns: list[str] | None,
+        filesystem: str | pa_fs.FileSystem | None,
+        filters: str | FilterType | Expression | None,
+    ) -> "pyarrow.Table":
+        if partitions is not None:
+            raise ValueError(
+                "`partitions` is deprecated and not supported with "
+                'engine="datafusion"; pass `filters` instead'
+            )
+        if filesystem is not None:
+            raise ValueError(
+                'filesystem is not supported with engine="datafusion"; pass '
+                "storage_options to DeltaTable instead"
+            )
+        try:
+            import pyarrow
+        except ImportError:
+            raise ImportError(
+                "Pyarrow is required, install deltalake[pyarrow] for pyarrow read functionality."
+            )
+
+        predicate: str | None = None
+        if isinstance(filters, str):
+            predicate = filters
+        elif isinstance(filters, list):
+            predicate = _filters_to_sql_predicate(filters) if filters else None
+        elif filters is not None:
+            raise ValueError(
+                'engine="datafusion" takes a SQL predicate string or tuple filters '
+                "(a list of (column, op, value) tuples, or a list of such lists); "
+                'pyarrow expressions require engine="pyarrow"'
+            )
+
+        reader = self._table.scan(columns=columns, predicate=predicate)
+        table = pyarrow.RecordBatchReader.from_stream(reader).read_all()
+        # the engine emits arrow view types; cast back to the table's logical schema
+        target = pyarrow.schema(self.schema().to_arrow())
+        if columns is not None:
+            target = pyarrow.schema([target.field(name) for name in columns])
+        return table.cast(target)
+
     def to_pandas(
         self,
         partitions: FilterType | None = None,
         columns: list[str] | None = None,
         filesystem: str | pa_fs.FileSystem | None = None,
-        filters: FilterType | Expression | None = None,
+        filters: str | FilterType | Expression | None = None,
         types_mapper: Callable[[pyarrow.DataType], Any] | None = None,
+        engine: Literal["pyarrow", "datafusion"] = "pyarrow",
     ) -> "pd.DataFrame":
         """
         Build a pandas dataframe using data from the DeltaTable.
@@ -1279,10 +1577,11 @@ class DeltaTable:
         files that cannot contain matching rows are never read, and the
         surviving rows are filtered exactly.
 
-        This method is a thin wrapper over `to_pyarrow_dataset`. The unrolled
-        chain is equivalent, and passing `file_pruning_predicate` there prunes
-        during log replay, before any per-file fragment setup, which can matter
-        on tables with very large file counts:
+        With `engine="pyarrow"` (the deprecated default), this method is a thin
+        wrapper over `to_pyarrow_dataset`. The unrolled chain is equivalent, and
+        passing `file_pruning_predicate` there prunes during log replay, before
+        any per-file fragment setup, which can matter on tables with very large
+        file counts:
 
         ```python
         dt.to_pandas(columns=cols, filters=[("year", "=", "2021")])
@@ -1294,19 +1593,40 @@ class DeltaTable:
         ).to_table(columns=cols).to_pandas()
         ```
 
+        With `engine="datafusion"`, the built-in engine reads the table instead;
+        it also reads tables the pyarrow engine cannot, such as those using
+        column mapping or deletion vectors. Row order is not guaranteed. The
+        engines differ in edge cases (NULL handling, duplicate projections); see
+        the "Choosing an engine" section of the Querying Delta Tables docs.
+
         Args:
             partitions: Deprecated. Use `filters`, or `to_pyarrow_dataset` with `file_pruning_predicate`
             columns: The columns to project. This can be a list of column names to include (order and duplicates will be preserved)
-            filesystem: A concrete implementation of the Pyarrow FileSystem or a fsspec-compatible interface. If None, the first file path will be used to determine the right FileSystem
-            filters: A disjunctive normal form (DNF) predicate for filtering rows, or directly a pyarrow.dataset.Expression
+            filesystem: A concrete implementation of the Pyarrow FileSystem or a fsspec-compatible interface. If None, the first file path will be used to determine the right FileSystem. `engine="pyarrow"` only
+            filters: A SQL predicate string (`engine="datafusion"` only) or a disjunctive normal form (DNF) tuple predicate for filtering rows. `engine="pyarrow"` also accepts a pyarrow.dataset.Expression
             types_mapper: A function mapping a pyarrow DataType to a pandas ExtensionDtype
+            engine: The engine reading the table. The pyarrow engine is deprecated and will be removed in a future release
         """
-        return self.to_pyarrow_table(
-            partitions=partitions,
-            columns=columns,
-            filesystem=filesystem,
-            filters=filters,
-        ).to_pandas(types_mapper=types_mapper)
+        match engine:
+            case "datafusion":
+                return self._to_pyarrow_table_datafusion(
+                    partitions=partitions,
+                    columns=columns,
+                    filesystem=filesystem,
+                    filters=filters,
+                ).to_pandas(types_mapper=types_mapper)
+            case "pyarrow":
+                _warn_pyarrow_engine("to_pandas")
+                return self._to_pyarrow_table_pyarrow(
+                    partitions=partitions,
+                    columns=columns,
+                    filesystem=filesystem,
+                    filters=filters,
+                ).to_pandas(types_mapper=types_mapper)
+            case _:
+                raise ValueError(
+                    f"unknown engine {engine!r}; expected 'pyarrow' or 'datafusion'"
+                )
 
     def update_incremental(self) -> None:
         """
@@ -1380,6 +1700,10 @@ class DeltaTable:
         When ``flatten=False`` (default), partition values and column
         statistics are returned as nested struct columns (``partition``,
         ``null_count``, ``min``, ``max``).
+
+        If the table supports deletion vectors, a nested ``deletion_vector``
+        column holds each file's deletion vector descriptor (null when the
+        file has none). Its ``cardinality`` field is the number of deleted rows.
 
         When ``flatten=True``, those structs are flattened into
         top-level columns with dot-separated prefixes, e.g.
@@ -1527,7 +1851,7 @@ class DeltaTable:
 
     def create_write_transaction(
         self,
-        actions: list[AddAction],
+        actions: list[AddAction | RemoveAction],
         mode: str,
         schema: DeltaSchema | ArrowSchemaExportable,
         partition_by: list[str] | str | None = None,
@@ -1536,6 +1860,25 @@ class DeltaTable:
         commit_properties: CommitProperties | None = None,
         post_commithook_properties: PostCommitHookProperties | None = None,
     ) -> None:
+        """
+        Commit file actions to the table as a single transaction.
+
+        Files referenced by an `AddAction` must already exist in the table location.
+        A `RemoveAction` marks an existing file as removed and is only allowed with
+        `mode="append"`; `mode="overwrite"` derives its own remove actions from the
+        partition filters. A path cannot be both added and removed in the same
+        transaction, and tables with `delta.appendOnly=true` reject remove actions
+        that have `data_change=True`.
+
+        Args:
+            actions: `AddAction` and `RemoveAction` entries to commit together.
+            mode: save mode of the write, `"append"` or `"overwrite"`.
+            schema: schema of the files being added.
+            partition_by: partition columns of the table.
+            partition_filters: partitions to replace when `mode="overwrite"`.
+            commit_properties: properties of the transaction commit.
+            post_commithook_properties: properties for the post commit hook.
+        """
         commit_properties, post_commithook_properties = (
             deprecate_positional_commit_args(
                 "create_write_transaction",
@@ -2432,8 +2775,9 @@ class TableOptimizer:
         """
         Compacts small files to reduce read overhead.
 
-        This operation is idempotent; if run twice on the same table (assuming it has
-        not been updated) it will do nothing the second time.
+        This operation is eventually idempotent; repeated runs on an unchanged table
+        converge to a stable layout, but a rewritten file that lands under the target
+        size can still be merged again by a later run.
 
         Compaction keeps file order within each partition.
 

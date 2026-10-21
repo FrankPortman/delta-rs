@@ -204,8 +204,6 @@ pub(crate) fn contains_variant<'a>(mut fields: impl Iterator<Item = &'a StructFi
 pub(crate) trait ProtocolExt {
     fn reader_features_set(&self) -> Option<HashSet<TableFeature>>;
     fn writer_features_set(&self) -> Option<HashSet<TableFeature>>;
-    fn append_reader_features(self, reader_features: &[TableFeature]) -> Protocol;
-    fn append_writer_features(self, writer_features: &[TableFeature]) -> Protocol;
     fn move_table_properties_into_features(
         self,
         configuration: &HashMap<String, String>,
@@ -227,18 +225,6 @@ impl ProtocolExt for Protocol {
     fn writer_features_set(&self) -> Option<HashSet<TableFeature>> {
         self.writer_features()
             .map(|features| features.iter().cloned().collect())
-    }
-
-    fn append_reader_features(self, reader_features: &[TableFeature]) -> Protocol {
-        let mut inner = ProtocolInner::from_kernel(&self);
-        inner = inner.append_reader_features(reader_features.iter().cloned());
-        inner.as_kernel()
-    }
-
-    fn append_writer_features(self, writer_features: &[TableFeature]) -> Protocol {
-        let mut inner = ProtocolInner::from_kernel(&self);
-        inner = inner.append_writer_features(writer_features.iter().cloned());
-        inner.as_kernel()
     }
 
     fn move_table_properties_into_features(
@@ -323,7 +309,8 @@ impl ProtocolInner {
 
     pub(crate) fn as_kernel(&self) -> Protocol {
         // this ugliness is a stop-gap until we resolve: https://github.com/delta-io/delta-kernel-rs/issues/1055
-        serde_json::from_value(serde_json::to_value(self).unwrap()).unwrap()
+        serde_json::from_value(serde_json::to_value(self).unwrap())
+            .expect("Failed to convert Protocol to a kernel implementation")
     }
 
     /// Append the reader features in the protocol action, automatically bumps min_reader_version
@@ -494,6 +481,30 @@ impl ProtocolInner {
             }
         }
 
+        // Check and update delta.minWriterVersion.
+        if let Some(min_writer_version) = parsed_properties.get(&TableProperty::MinWriterVersion) {
+            let new_min_writer_version = min_writer_version.parse::<i32>();
+            match new_min_writer_version {
+                Ok(version) => match version {
+                    2..=7 => {
+                        if version > self.min_writer_version {
+                            self.min_writer_version = version
+                        }
+                    }
+                    _ => {
+                        return Err(Error::Generic(format!(
+                            "delta.minWriterVersion = '{min_writer_version}' is invalid, valid values are ['2','3','4','5','6','7']"
+                        )));
+                    }
+                },
+                Err(_) => {
+                    return Err(Error::Generic(format!(
+                        "delta.minWriterVersion = '{min_writer_version}' is invalid, valid values are ['2','3','4','5','6','7']"
+                    )));
+                }
+            }
+        }
+
         // Check and update delta.minReaderVersion
         if let Some(min_reader_version) = parsed_properties.get(&TableProperty::MinReaderVersion) {
             let new_min_reader_version = min_reader_version.parse::<i32>();
@@ -518,27 +529,23 @@ impl ProtocolInner {
             }
         }
 
-        // Check and update delta.minWriterVersion
-        if let Some(min_writer_version) = parsed_properties.get(&TableProperty::MinWriterVersion) {
-            let new_min_writer_version = min_writer_version.parse::<i32>();
-            match new_min_writer_version {
-                Ok(version) => match version {
-                    2..=7 => {
-                        if version > self.min_writer_version {
-                            self.min_writer_version = version
-                        }
-                    }
-                    _ => {
-                        return Err(Error::Generic(format!(
-                            "delta.minWriterVersion = '{min_writer_version}' is invalid, valid values are ['2','3','4','5','6','7']"
-                        )));
-                    }
-                },
-                Err(_) => {
-                    return Err(Error::Generic(format!(
-                        "delta.minWriterVersion = '{min_writer_version}' is invalid, valid values are ['2','3','4','5','6','7']"
-                    )));
-                }
+        // Check columnMappingMode and bump protocol or add reader/writerFeatures
+        if let Some(mode) = parsed_properties.get(&TableProperty::ColumnMappingMode)
+            && mode.as_str() != "none"
+        {
+            if self.min_reader_version >= 3 {
+                self.reader_features
+                    .get_or_insert_with(HashSet::new)
+                    .insert(TableFeature::ColumnMapping);
+            } else {
+                self.min_reader_version = self.min_reader_version.max(2);
+            }
+            if self.min_writer_version >= 7 {
+                self.writer_features
+                    .get_or_insert_with(HashSet::new)
+                    .insert(TableFeature::ColumnMapping);
+            } else {
+                self.min_writer_version = self.min_writer_version.max(5);
             }
         }
 
@@ -601,6 +608,24 @@ impl ProtocolInner {
                     )));
                 }
             }
+        }
+
+        // If the minWriterVersion has been set to 7 then there are additional writer features
+        // which must be applied
+        if self.min_writer_version >= 7
+            && let Some(features) = writer_features_for_version(self.min_writer_version)
+        {
+            self = self.append_writer_features(features);
+            // When setting the minWriterVersion the minReaderVersion must necessarily come up to
+            // version 2 if it's not already there
+            if self.min_reader_version < 2 {
+                self.min_reader_version = 2;
+            }
+        }
+        // minReaderVersion 3 needs a readerFeatures list, but it lists only the features the table
+        // uses, so it can be empty
+        if self.min_reader_version >= 3 && self.reader_features.is_none() {
+            self.reader_features = Some(HashSet::new());
         }
         Ok(self)
     }
@@ -769,65 +794,56 @@ impl fmt::Display for TableFeatures {
     }
 }
 
-impl TryFrom<&TableFeatures> for TableFeature {
-    type Error = std::convert::Infallible;
-
-    fn try_from(value: &TableFeatures) -> Result<Self, Self::Error> {
-        TableFeature::try_from(value.as_ref())
+impl From<&TableFeatures> for TableFeature {
+    fn from(value: &TableFeatures) -> Self {
+        TableFeature::from(value.as_ref())
     }
 }
 
 impl TableFeatures {
     /// Convert table feature to respective reader or/and write feature
     pub fn to_reader_writer_features(&self) -> (Option<TableFeature>, Option<TableFeature>) {
-        let feature = TableFeature::try_from(self).ok();
+        let feature = TableFeature::from(self);
+        // Classify features based on their type
+        // Writer-only features
         match feature {
-            Some(feature) => {
-                // Classify features based on their type
-                // Writer-only features
-                match feature {
-                    TableFeature::AppendOnly
-                    | TableFeature::Invariants
-                    | TableFeature::CheckConstraints
-                    | TableFeature::ChangeDataFeed
-                    | TableFeature::GeneratedColumns
-                    | TableFeature::IdentityColumns
-                    | TableFeature::InCommitTimestamp
-                    | TableFeature::RowTracking
-                    | TableFeature::DomainMetadata
-                    | TableFeature::IcebergCompatV1
-                    | TableFeature::IcebergCompatV2
-                    | TableFeature::ClusteredTable
-                    | TableFeature::MaterializePartitionColumns => (None, Some(feature)),
+            TableFeature::AppendOnly
+            | TableFeature::Invariants
+            | TableFeature::CheckConstraints
+            | TableFeature::ChangeDataFeed
+            | TableFeature::GeneratedColumns
+            | TableFeature::IdentityColumns
+            | TableFeature::InCommitTimestamp
+            | TableFeature::RowTracking
+            | TableFeature::DomainMetadata
+            | TableFeature::IcebergCompatV1
+            | TableFeature::IcebergCompatV2
+            | TableFeature::ClusteredTable
+            | TableFeature::MaterializePartitionColumns => (None, Some(feature)),
 
-                    // ReaderWriter features
-                    TableFeature::CatalogManaged
-                    | TableFeature::CatalogOwnedPreview
-                    | TableFeature::ColumnMapping
-                    | TableFeature::DeletionVectors
-                    | TableFeature::TimestampWithoutTimezone
-                    | TableFeature::TypeWidening
-                    | TableFeature::TypeWideningPreview
-                    | TableFeature::V2Checkpoint
-                    | TableFeature::VacuumProtocolCheck
-                    | TableFeature::VariantType
-                    | TableFeature::VariantTypePreview
-                    | TableFeature::VariantShreddingPreview => {
-                        (Some(feature.clone()), Some(feature))
-                    }
+            // ReaderWriter features
+            TableFeature::CatalogManaged
+            | TableFeature::CatalogOwnedPreview
+            | TableFeature::ColumnMapping
+            | TableFeature::DeletionVectors
+            | TableFeature::TimestampWithoutTimezone
+            | TableFeature::TypeWidening
+            | TableFeature::TypeWideningPreview
+            | TableFeature::V2Checkpoint
+            | TableFeature::VacuumProtocolCheck
+            | TableFeature::VariantType
+            | TableFeature::VariantTypePreview
+            | TableFeature::VariantShreddingPreview => (Some(feature.clone()), Some(feature)),
 
-                    // Optional ReaderWriter features
-                    #[cfg(feature = "nanosecond-timestamps")]
-                    TableFeature::TimestampNanos => (Some(feature.clone()), Some(feature)),
+            // Optional ReaderWriter features
+            #[cfg(feature = "nanosecond-timestamps")]
+            TableFeature::TimestampNanos => (Some(feature.clone()), Some(feature)),
 
-                    // Unknown features
-                    TableFeature::Unknown(_) => (None, None),
-                    others => {
-                        panic!("This table has unsupported table features: {others:?}");
-                    }
-                }
+            // Unknown features
+            TableFeature::Unknown(_) => (None, None),
+            others => {
+                panic!("This table has unsupported table features: {others:?}");
             }
-            None => (None, None),
         }
     }
 }
@@ -911,6 +927,30 @@ pub struct DeletionVectorDescriptor {
 
     /// Number of rows the given DV logically removes from the file.
     pub cardinality: i64,
+}
+
+impl TryFrom<DeletionVectorDescriptor>
+    for delta_kernel::actions::deletion_vector::DeletionVectorDescriptor
+{
+    type Error = delta_kernel::Error;
+
+    fn try_from(dv: DeletionVectorDescriptor) -> Result<Self, Self::Error> {
+        use delta_kernel::actions::deletion_vector::DeletionVectorStorageType;
+
+        let storage_type = match dv.storage_type {
+            StorageType::UuidRelativePath => DeletionVectorStorageType::PersistedRelative,
+            StorageType::Inline => DeletionVectorStorageType::Inline,
+            StorageType::AbsolutePath => DeletionVectorStorageType::PersistedAbsolute,
+        };
+
+        Self::try_new(
+            storage_type,
+            dv.path_or_inline_dv,
+            dv.offset,
+            dv.size_in_bytes,
+            dv.cardinality,
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1287,13 +1327,29 @@ pub(crate) mod serde_path {
         .add(b'*')
         .add(b'?');
 
-    fn encode_path(path: &str) -> String {
+    pub(crate) fn encode_path(path: &str) -> String {
         utf8_percent_encode(path, INVALID).to_string()
     }
 
     // rfc3986's percent_decode_str is fallible, so decoding stays on the url spec crate.
     pub fn decode_path(path: &str) -> Result<String, Utf8Error> {
         Ok(percent_decode_str(path).decode_utf8()?.to_string())
+    }
+}
+
+/// Determine required writer features for a given writer version
+pub(crate) fn writer_features_for_version(
+    writer_version: i32,
+) -> Option<Vec<delta_kernel::table_features::TableFeature>> {
+    if writer_version >= 7 {
+        // For writer version 7+, include common features
+        Some(vec![
+            delta_kernel::table_features::TableFeature::Invariants,
+            delta_kernel::table_features::TableFeature::AppendOnly,
+        ])
+    } else {
+        // No special features needed for older versions
+        None
     }
 }
 
@@ -1418,6 +1474,150 @@ mod tests {
 
         let add: Add = serde_json::from_value(raw).unwrap();
         assert_eq!(add.path, "city=New York/part-00000-abc.parquet");
+    }
+
+    #[test]
+    fn test_apply_properties_column_mapping_legacy_versions() {
+        let protocol: Protocol = serde_json::from_value(serde_json::json!({
+            "minReaderVersion": 1,
+            "minWriterVersion": 2,
+        }))
+        .unwrap();
+        let config = HashMap::from([("delta.columnMapping.mode".to_string(), "name".to_string())]);
+
+        let protocol = protocol
+            .apply_properties_to_protocol(&config, true)
+            .unwrap();
+
+        assert_eq!(protocol.min_reader_version(), 2);
+        assert_eq!(protocol.min_writer_version(), 5);
+    }
+
+    #[test]
+    fn test_apply_properties_column_mapping_table_features() {
+        // On a table-features protocol (reader v3 / writer v7), column mapping is a ReaderWriter
+        // feature and must be declared in both the reader and writer feature lists.
+        let protocol: Protocol = serde_json::from_value(serde_json::json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": [],
+            "writerFeatures": [],
+        }))
+        .expect("Failed to initialize a new Protocol");
+        let config = HashMap::from([("delta.columnMapping.mode".to_string(), "name".to_string())]);
+
+        let protocol = protocol
+            .apply_properties_to_protocol(&config, true)
+            .expect("Failed to apply properties to protocol");
+
+        assert_eq!(protocol.min_reader_version(), 3);
+        assert_eq!(protocol.min_writer_version(), 7);
+        assert!(
+            protocol
+                .reader_features()
+                .unwrap()
+                .contains(&TableFeature::ColumnMapping),
+            "readerFeatures should contain ColumnMapping, got: {:?}",
+            protocol.reader_features()
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap()
+                .contains(&TableFeature::ColumnMapping),
+            "writerFeatures should contain ColumnMapping, got: {:?}",
+            protocol.writer_features()
+        );
+    }
+
+    #[test]
+    fn test_apply_properties_does_not_add_unused_variant_type() {
+        // Reader v3 / writer v7 alone must not declare variantType: readers without Variant
+        // support refuse any table that lists it (#4835). Variant columns enable it from the schema.
+        let timestamp_ntz: Protocol = serde_json::from_value(serde_json::json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["timestampNtz"],
+            "writerFeatures": ["timestampNtz"],
+        }))
+        .unwrap();
+        let legacy: Protocol = serde_json::from_value(serde_json::json!({
+            "minReaderVersion": 1,
+            "minWriterVersion": 2,
+        }))
+        .unwrap();
+        let cases = [
+            (timestamp_ntz, HashMap::new()),
+            (
+                legacy,
+                HashMap::from([
+                    ("delta.minReaderVersion".to_string(), "3".to_string()),
+                    ("delta.minWriterVersion".to_string(), "7".to_string()),
+                ]),
+            ),
+        ];
+
+        for (protocol, config) in cases {
+            let protocol = protocol
+                .apply_properties_to_protocol(&config, true)
+                .unwrap();
+
+            assert_eq!(protocol.min_reader_version(), 3);
+            assert_eq!(protocol.min_writer_version(), 7);
+            for features in [protocol.reader_features(), protocol.writer_features()] {
+                assert!(
+                    !features.is_some_and(|f| f.contains(&TableFeature::VariantType)),
+                    "variantType should not be added without a variant column, got: {features:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_properties_column_mapping_independent_reader_writer() {
+        // Reader and writer are bumped independently: a feature-based writer (v7) declares the
+        // ColumnMapping writer feature, while the legacy reader is bumped to v2.
+        let protocol: Protocol = serde_json::from_value(serde_json::json!({
+            "minReaderVersion": 1,
+            "minWriterVersion": 7,
+            "writerFeatures": [],
+        }))
+        .unwrap();
+        let config = HashMap::from([("delta.columnMapping.mode".to_string(), "name".to_string())]);
+
+        let protocol = protocol
+            .apply_properties_to_protocol(&config, true)
+            .unwrap();
+
+        assert_eq!(protocol.min_reader_version(), 2);
+        assert_eq!(protocol.min_writer_version(), 7);
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap()
+                .contains(&TableFeature::ColumnMapping),
+            "writerFeatures should contain ColumnMapping, got: {:?}",
+            protocol.writer_features()
+        );
+
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap()
+                .contains(&TableFeature::Invariants),
+            "writerFeatures should be upgraded include Invariants, got: {:?}",
+            protocol.writer_features()
+        );
+
+        // Reader stayed legacy (v2), so it carries no ColumnMapping reader feature.
+        assert!(
+            !protocol
+                .reader_features()
+                .map(|f| f.contains(&TableFeature::ColumnMapping))
+                .unwrap_or(false),
+            "reader side should remain legacy, got: {:?}",
+            protocol.reader_features()
+        );
     }
 
     // #[test]

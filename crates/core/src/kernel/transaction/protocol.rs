@@ -126,7 +126,10 @@ impl ProtocolChecker {
         snapshot: &EagerSnapshot,
         schema: &Schema,
     ) -> Result<(), TransactionError> {
-        trace!("checking to see if {snapshot:?} can write timestampntz");
+        trace!(
+            "checking if snapshot v{} can write timestampntz",
+            snapshot.version()
+        );
         self.check_can_write_feature(
             snapshot,
             contains_timestampntz(schema.fields()),
@@ -142,7 +145,10 @@ impl ProtocolChecker {
         snapshot: &EagerSnapshot,
         schema: &Schema,
     ) -> Result<(), TransactionError> {
-        trace!("checking to see if {snapshot:?} can write timestampnanos");
+        trace!(
+            "checking if snapshot v{} can write timestampnanos",
+            snapshot.version()
+        );
         let contains_nanos = contains_timestamp_nanos(schema.fields());
         self.check_can_write_feature(snapshot, contains_nanos, TableFeature::TimestampNanos)?;
         self.check_can_write_feature(
@@ -158,7 +164,10 @@ impl ProtocolChecker {
         snapshot: &EagerSnapshot,
         schema: &Schema,
     ) -> Result<(), TransactionError> {
-        trace!("checking to see if {snapshot:?} can write variant");
+        trace!(
+            "checking if snapshot v{} can write variant",
+            snapshot.version()
+        );
         let contains_variant = contains_variant(schema.fields());
         let required_features: Option<&[TableFeature]> =
             match snapshot.protocol().min_writer_version() {
@@ -303,6 +312,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     reader_features.insert(TableFeature::VariantType);
     reader_features.insert(TableFeature::VariantTypePreview);
     reader_features.insert(TableFeature::V2Checkpoint);
+    reader_features.insert(TableFeature::CatalogManaged);
+    reader_features.insert(TableFeature::VacuumProtocolCheck);
     #[cfg(feature = "nanosecond-timestamps")]
     reader_features.insert(TableFeature::TimestampNanos);
     #[cfg(feature = "datafusion")]
@@ -328,6 +339,12 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     }
     writer_features.insert(TableFeature::DeletionVectors);
     // writer_features.insert(TableFeature::IdentityColumns);
+    // `checkpointProtection` is a writer-only feature which constrains checkpoint
+    // creation and metadata cleanup, neither of which this crate performs when
+    // writing. delta-rs only ever appends data, so it can safely claim support
+    // (see https://github.com/delta-io/delta-rs/issues/4462). There is no named
+    // kernel variant yet, so use the Unknown representation.
+    writer_features.insert(TableFeature::Unknown("checkpointProtection".to_owned()));
 
     ProtocolChecker::new(reader_features, writer_features)
 });

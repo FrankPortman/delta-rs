@@ -9,13 +9,14 @@ use arrow::record_batch::RecordBatch;
 use arrow_select::coalesce::BatchCoalescer;
 use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel};
 use delta_kernel::expressions::column_expr_ref;
+use delta_kernel::scan::scan_row_schema;
 use delta_kernel::schema::{SchemaRef as KernelSchemaRef, StructField};
+use delta_kernel::table_features::TableFeature;
 use delta_kernel::table_properties::TableProperties;
 use delta_kernel::{EvaluationHandler, Expression};
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
-use super::DeltaTableConfig;
 #[cfg(test)]
 use crate::kernel::Action;
 use crate::kernel::arrow::engine_ext::{ExpressionEvaluatorExt, SnapshotExt};
@@ -41,14 +42,10 @@ impl DeltaTableState {
     }
 
     /// Create a new DeltaTableState
-    pub async fn try_new(
-        log_store: &dyn LogStore,
-        config: DeltaTableConfig,
-        version: Option<Version>,
-    ) -> DeltaResult<Self> {
+    pub async fn try_new(log_store: &dyn LogStore, version: Option<Version>) -> DeltaResult<Self> {
         log_store.refresh().await?;
         // TODO: pass through predictae
-        let snapshot = EagerSnapshot::try_new(log_store, config, version).await?;
+        let snapshot = EagerSnapshot::try_new(log_store, version).await?;
         Ok(Self { snapshot })
     }
 
@@ -70,11 +67,6 @@ impl DeltaTableState {
     /// The table schema
     pub fn schema(&self) -> KernelSchemaRef {
         self.snapshot.schema()
-    }
-
-    /// Get the table config which is loaded with of the snapshot
-    pub fn load_config(&self) -> &DeltaTableConfig {
-        self.snapshot.load_config()
     }
 
     /// Well known table configuration
@@ -195,6 +187,9 @@ impl DeltaTableState {
     ///   (if available).
     /// * `partition.{partition column name}` (matches column type): value of
     ///   partition the file corresponds to.
+    /// * `deletion_vector.{field}`: the file's deletion vector descriptor, with
+    ///   `cardinality` (Int64) being the number of deleted rows. Only present when
+    ///   the table supports deletion vectors, and null for files without one.
     pub fn add_actions_table(
         &self,
         flatten: bool,
@@ -239,6 +234,9 @@ impl Snapshot {
     ///   (if available).
     /// * `partition.{partition column name}` (matches column type): value of
     ///   partition the file corresponds to.
+    /// * `deletion_vector.{field}`: the file's deletion vector descriptor, with
+    ///   `cardinality` (Int64) being the number of deleted rows. Only present when
+    ///   the table supports deletion vectors, and null for files without one.
     pub(crate) fn add_actions_table(
         &self,
         flatten: bool,
@@ -410,6 +408,21 @@ impl Snapshot {
             expressions.push(column_expr_ref!("partitionValues_parsed"));
         }
 
+        if self
+            .inner
+            .table_configuration()
+            .is_feature_supported(&TableFeature::DeletionVectors)
+        {
+            let deletion_vector_field = scan_row_schema()
+                .field("deletionVector")
+                .ok_or_else(|| DeltaTableError::SchemaMismatch {
+                    msg: "deletionVector field not found in scan row schema".to_string(),
+                })?
+                .with_name("deletion_vector");
+            expressions.push(column_expr_ref!("deletionVector"));
+            fields.push(deletion_vector_field);
+        }
+
         let expression = Expression::Struct(expressions, None);
         let table_schema = DataType::try_struct_type(fields)?;
         Ok((expression, table_schema))
@@ -530,7 +543,10 @@ mod tests {
     #[cfg(feature = "datafusion")]
     use crate::writer::test_utils::get_record_batch;
     use crate::{DeltaResult, DeltaTable};
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
     use arrow_array::{Array, Int32Array};
+    use std::collections::HashMap;
 
     /// <https://github.com/delta-io/delta-rs/issues/3918>
     #[tokio::test]
@@ -558,6 +574,63 @@ mod tests {
         let snapshot = table.snapshot()?.snapshot();
         assert!(snapshot.add_actions_batches(false)?.is_empty());
         assert!(snapshot.add_actions_batches(true)?.is_empty());
+        Ok(())
+    }
+
+    async fn open_fixture_state(name: &str) -> DeltaResult<DeltaTableState> {
+        let path = std::fs::canonicalize(format!("../test/tests/data/{name}"))?;
+        let url = url::Url::from_directory_path(path).expect("fixture path is absolute");
+        let table = crate::open_table(url).await?;
+        Ok(table.snapshot()?.clone())
+    }
+
+    #[tokio::test]
+    async fn test_add_actions_deletion_vector_cardinality_matches_log() -> DeltaResult<()> {
+        for name in ["table-with-dv-small", "table_with_deletion_logs"] {
+            let state = open_fixture_state(name).await?;
+            let expected: HashMap<String, Option<i64>> = state
+                .log_data()
+                .iter()
+                .map(|file| {
+                    let cardinality = file.deletion_vector_descriptor().map(|dv| dv.cardinality);
+                    (file.path().to_string(), cardinality)
+                })
+                .collect();
+            assert!(expected.values().any(Option::is_some), "{name} has no DVs");
+
+            let actions = state.add_actions_table(true)?;
+            let paths = actions.column_by_name("path").unwrap().as_string::<i32>();
+            let cardinality = actions
+                .column_by_name("deletion_vector.cardinality")
+                .unwrap()
+                .as_primitive::<Int64Type>();
+            let actual: HashMap<String, Option<i64>> = paths
+                .iter()
+                .zip(cardinality.iter())
+                .map(|(path, cardinality)| (path.unwrap().to_string(), cardinality))
+                .collect();
+            assert_eq!(actual, expected, "{name}");
+
+            let nested = state.add_actions_table(false)?;
+            assert!(nested.column_by_name("deletion_vector").is_some(), "{name}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_actions_without_deletion_vector_feature_has_no_dv_column() -> DeltaResult<()>
+    {
+        let state = open_fixture_state("table-without-dv-small").await?;
+        for flatten in [true, false] {
+            let actions = state.add_actions_table(flatten)?;
+            assert!(
+                actions
+                    .schema()
+                    .fields()
+                    .iter()
+                    .all(|field| !field.name().starts_with("deletion_vector"))
+            );
+        }
         Ok(())
     }
 
@@ -592,39 +665,6 @@ mod tests {
 
     #[cfg(feature = "datafusion")]
     #[tokio::test]
-    async fn test_add_actions_batches_skip_stats_returns_null_stats() -> DeltaResult<()> {
-        let table = DeltaTable::new_in_memory()
-            .create()
-            .with_columns(get_delta_schema().fields().cloned())
-            .await?;
-        let table = table
-            .write(vec![get_record_batch(None, false)])
-            .with_save_mode(SaveMode::Append)
-            .await?;
-
-        let config = DeltaTableConfig {
-            skip_stats: true,
-            ..Default::default()
-        };
-        let log_store = table.log_store();
-        let snapshot = EagerSnapshot::try_new(log_store.as_ref(), config, None).await?;
-        let batches = snapshot.snapshot().add_actions_batches(true)?;
-
-        assert!(!batches.is_empty());
-        let batch = concat_batches(batches[0].schema_ref(), &batches)?;
-        for column_name in ["num_records", "min.value", "max.value"] {
-            let column = batch
-                .column_by_name(column_name)
-                .unwrap_or_else(|| panic!("expected add actions output to contain {column_name}"));
-            assert_eq!(column.null_count(), batch.num_rows());
-            assert!((0..batch.num_rows()).all(|row| column.is_null(row)));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(feature = "datafusion")]
-    #[tokio::test]
     async fn test_delta_table_state_serde_roundtrip_preserves_add_actions() -> DeltaResult<()> {
         let table = DeltaTable::new_in_memory()
             .create()
@@ -644,48 +684,6 @@ mod tests {
 
         assert_eq!(actual.version(), state.version());
         assert_eq!(after, before);
-        Ok(())
-    }
-
-    #[cfg(feature = "datafusion")]
-    #[tokio::test]
-    async fn test_delta_table_state_without_files_roundtrip_stays_without_files() -> DeltaResult<()>
-    {
-        let table = DeltaTable::new_in_memory()
-            .create()
-            .with_columns(get_delta_schema().fields().cloned())
-            .await?;
-        let table = table
-            .write(vec![get_record_batch(None, false)])
-            .with_save_mode(SaveMode::Append)
-            .await?;
-
-        let config = DeltaTableConfig {
-            require_files: false,
-            ..Default::default()
-        };
-        let state = DeltaTableState::try_new(table.log_store().as_ref(), config, None).await?;
-        assert!(
-            !state
-                .snapshot()
-                .snapshot()
-                .has_materialized_files_for_test()
-        );
-
-        let bytes = serde_json::to_vec(&state)?;
-        let actual: DeltaTableState = serde_json::from_slice(&bytes)?;
-
-        assert_eq!(actual.version(), state.version());
-        assert!(
-            !actual
-                .snapshot()
-                .snapshot()
-                .has_materialized_files_for_test()
-        );
-        assert!(matches!(
-            actual.add_actions_table(true),
-            Err(DeltaTableError::NotInitializedWithFiles(_))
-        ));
         Ok(())
     }
 
@@ -770,12 +768,7 @@ mod tests {
             .with_save_mode(SaveMode::Append)
             .await?;
 
-        let snapshot = Snapshot::try_new(
-            table.log_store().as_ref(),
-            DeltaTableConfig::default(),
-            None,
-        )
-        .await?;
+        let snapshot = Snapshot::try_new(table.log_store().as_ref(), None).await?;
         let snapshot = Arc::new(snapshot)
             .ensure_materialized_files(table.log_store().as_ref())
             .await?;

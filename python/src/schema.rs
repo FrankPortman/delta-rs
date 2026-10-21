@@ -184,7 +184,7 @@ pub struct ArrayType {
     inner_type: DeltaArrayType,
 }
 
-#[pyclass(module = "deltalake._internal")]
+#[pyclass(module = "deltalake._internal", from_py_object)]
 #[derive(Clone)]
 pub struct VariantType;
 
@@ -837,9 +837,9 @@ pub fn schema_to_pyobject(
 /// Or create from a [pyarrow.Schema][pyarrow.Schema]:
 ///
 /// ```py
-/// from arro3.core import DateType, Schema as ArrowSchema
-/// Schema.from_pyarrow(ArrowSchema({"x": DateType.int32(), "y": DateType.string()}))
-/// Schema([Field(x, PrimitiveType("integer"), nullable=True), Field(y, PrimitiveType("string"), nullable=True)])
+/// from arro3.core import DataType, Field as ArrowField, Schema as ArrowSchema
+/// Schema.from_arrow(ArrowSchema([ArrowField("x", DataType.int32()), ArrowField("y", DataType.string())]))
+/// Schema([Field("x", PrimitiveType("integer"), nullable=True), Field("y", PrimitiveType("string"), nullable=True)])
 /// ```
 #[pyclass(extends = StructType, name = "Schema", module = "deltalake._internal")]
 pub struct PySchema;
@@ -848,14 +848,14 @@ pub struct PySchema;
 impl PySchema {
     #[new]
     #[pyo3(signature = (fields))]
-    fn new(fields: Vec<PyRef<Field>>) -> PyResult<(Self, StructType)> {
+    fn new(fields: Vec<PyRef<Field>>) -> PyResult<PyClassInitializer<Self>> {
         let fields: Vec<StructField> = fields
             .into_iter()
             .map(|field| field.inner.clone())
             .collect();
         let inner_type = DeltaStructType::try_new(fields)
             .map_err(|e| SchemaMismatchError::new_err(e.to_string()))?;
-        Ok((Self {}, StructType { inner_type }))
+        Ok(PyClassInitializer::from(StructType { inner_type }).add_subclass(Self))
     }
 
     fn __repr__(self_: PyRef<'_, Self>, py: Python) -> PyResult<String> {

@@ -1,28 +1,23 @@
 //! Delta Table read and write implementation
 
-use std::cmp::{Ordering, min};
 use std::fmt;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use delta_kernel::expressions::PredicateRef;
+use futures::TryStreamExt;
 use futures::future::ready;
 use futures::stream::{BoxStream, once};
-use futures::{StreamExt, TryStreamExt};
-use object_store::{ObjectStore, ObjectStoreExt as _, path::Path};
+use object_store::path::Path;
 use serde::de::{Error, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
 
-use self::builder::DeltaTableConfig;
 use self::state::DeltaTableState;
-use crate::kernel::{CommitInfo, DataCheck, LogicalFileView, Version};
-use crate::logstore::{
-    LogStoreConfig, LogStoreExt, LogStoreRef, ObjectStoreRef, commit_uri_from_version,
-    extract_version_from_filename,
-};
+use crate::kernel::{CommitInfo, DataCheck, LogicalFileView, Snapshot, Version};
+use crate::logstore::{LogStoreConfig, LogStoreRef, ObjectStoreRef};
 use crate::partitions::FilterLiteral;
 use crate::{DeltaResult, DeltaTableBuilder, DeltaTableError};
 
@@ -48,8 +43,6 @@ pub use columns::*;
 pub struct DeltaTable {
     /// The state of the table as of the most recent loaded Delta log entry.
     pub state: Option<DeltaTableState>,
-    /// the load options used during load
-    pub config: DeltaTableConfig,
     /// log store
     pub(crate) log_store: LogStoreRef,
 }
@@ -61,7 +54,6 @@ impl Serialize for DeltaTable {
     {
         let mut seq = serializer.serialize_seq(None)?;
         seq.serialize_element(&self.state)?;
-        seq.serialize_element(&self.config)?;
         seq.serialize_element(self.log_store.config())?;
         seq.end()
     }
@@ -88,23 +80,31 @@ impl<'de> Deserialize<'de> for DeltaTable {
                 let state = seq
                     .next_element()?
                     .ok_or_else(|| A::Error::invalid_length(0, &self))?;
-                let config = seq
+                #[derive(Deserialize)]
+                #[serde(untagged)]
+                enum StorageOrLegacyConfig {
+                    Storage(Box<LogStoreConfig>),
+                    Legacy {
+                        #[serde(rename = "requireFiles", alias = "require_files")]
+                        _require_files: bool,
+                    },
+                }
+                let storage_config = match seq
                     .next_element()?
-                    .ok_or_else(|| A::Error::invalid_length(0, &self))?;
-                let storage_config: LogStoreConfig = seq
-                    .next_element()?
-                    .ok_or_else(|| A::Error::invalid_length(0, &self))?;
+                    .ok_or_else(|| A::Error::invalid_length(1, &self))?
+                {
+                    StorageOrLegacyConfig::Storage(config) => *config,
+                    StorageOrLegacyConfig::Legacy { .. } => seq
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(2, &self))?,
+                };
                 let log_store = crate::logstore::logstore_for(
                     storage_config.location(),
                     storage_config.options().clone(),
                 )
                 .map_err(|_| A::Error::custom("Failed deserializing LogStore"))?;
 
-                let table = DeltaTable {
-                    state,
-                    config,
-                    log_store,
-                };
+                let table = DeltaTable { state, log_store };
                 Ok(table)
             }
         }
@@ -118,11 +118,10 @@ impl DeltaTable {
     ///
     /// NOTE: This is for advanced users. If you don't know why you need to use this method, please
     /// call one of the `open_table` helper methods instead.
-    pub fn new(log_store: LogStoreRef, config: DeltaTableConfig) -> Self {
+    pub fn new(log_store: LogStoreRef) -> Self {
         Self {
             state: None,
             log_store,
-            config,
         }
     }
 
@@ -146,17 +145,15 @@ impl DeltaTable {
     /// NOTE: This is for advanced users. If you don't know why you need to use this method,
     /// please call one of the `open_table` helper methods instead.
     pub(crate) fn new_with_state(log_store: LogStoreRef, state: DeltaTableState) -> Self {
-        let config = state.load_config().clone();
         Self {
             state: Some(state),
             log_store,
-            config,
         }
     }
 
     /// get a shared reference to the delta object store
     pub fn object_store(&self) -> ObjectStoreRef {
-        self.log_store.object_store(None)
+        self.log_store.object_store()
     }
 
     /// Check if the [`DeltaTable`] exists
@@ -209,9 +206,7 @@ impl DeltaTable {
         max_version: Option<Version>,
     ) -> Result<(), DeltaTableError> {
         let Some(state) = self.state.as_mut() else {
-            self.state = Some(
-                DeltaTableState::try_new(&self.log_store, self.config.clone(), max_version).await?,
-            );
+            self.state = Some(DeltaTableState::try_new(&self.log_store, max_version).await?);
             return Ok(());
         };
 
@@ -239,44 +234,27 @@ impl DeltaTable {
         self.update_incremental(Some(version)).await
     }
 
-    pub(crate) async fn get_version_timestamp(
-        &self,
-        version: Version,
-    ) -> Result<i64, DeltaTableError> {
-        match self
-            .state
-            .as_ref()
-            .and_then(|s| s.version_timestamp(version))
-        {
-            Some(ts) => Ok(ts),
-            None => {
-                let meta = self
-                    .object_store()
-                    .head(&commit_uri_from_version(Some(version)))
-                    .await?;
-                let ts = meta.last_modified.timestamp_millis();
-                Ok(ts)
-            }
-        }
-    }
-
-    /// Returns provenance information, including the operation, user, and so on, for each write to a table.
+    /// Streams provenance information for each write to the table, newest commit first.
+    ///
     /// The table history retention is based on the `logRetentionDuration` property of the Delta Table, 30 days by default.
     /// If `limit` is given, this returns the information of the latest `limit` commits made to this table. Otherwise,
     /// it returns all commits from the earliest commit.
-    pub async fn history(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<impl Iterator<Item = CommitInfo> + use<>, DeltaTableError> {
-        let infos = self
-            .snapshot()?
-            .snapshot()
-            .snapshot()
-            .commit_infos(&self.log_store(), limit)
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(infos.into_iter().flatten())
+    pub fn history(&self, limit: Option<usize>) -> BoxStream<'_, DeltaResult<CommitInfo>> {
+        let Some(state) = self.state.as_ref() else {
+            return Box::pin(once(ready(Err(DeltaTableError::NotInitialized))));
+        };
+        let log_store = self.log_store();
+        Box::pin(
+            once(async move {
+                state
+                    .snapshot()
+                    .snapshot()
+                    .commit_infos(&log_store, limit)
+                    .await
+            })
+            .try_flatten()
+            .try_filter_map(|info| ready(Ok(info))),
+        )
     }
 
     #[cfg(test)]
@@ -284,7 +262,7 @@ impl DeltaTable {
     ///
     /// This is a silly convenience function to reduce some copy-paste in tests
     pub(crate) async fn last_commit(&self) -> Result<CommitInfo, DeltaTableError> {
-        let mut infos: Vec<_> = self.history(Some(1)).await?.collect();
+        let mut infos: Vec<_> = self.history(Some(1)).try_collect().await?;
         infos.pop().ok_or(DeltaTableError::Generic(
             "Somehow there is nothing in the history!".into(),
         ))
@@ -393,94 +371,17 @@ impl DeltaTable {
     /// Time travel Delta table to the latest version that's created at or before provided
     /// `datetime` argument.
     ///
-    /// Internally, this methods performs a binary search on all Delta transaction logs.
+    /// Commits made while in-commit timestamps are enabled are compared by their
+    /// `inCommitTimestamp`, earlier commits by the modification time of their log file.
     pub async fn load_with_datetime(
         &mut self,
         datetime: DateTime<Utc>,
     ) -> Result<(), DeltaTableError> {
-        let mut min_version: i64 = -1;
-        let log_store = self.log_store();
-        let prefix = log_store.log_path();
-        let offset_path = commit_uri_from_version(None);
-        let object_store = log_store.object_store(None);
-        let mut files = object_store.list_with_offset(Some(prefix), &offset_path);
-
-        while let Some(obj_meta) = files.next().await {
-            let obj_meta = obj_meta?;
-            let location_path: Path = obj_meta.location.clone();
-            let part_count = location_path.prefix_match(prefix).unwrap().count();
-            if part_count > 1 {
-                // Per the spec, ignore any files in subdirectories.
-                // Spark may create these as uncommitted transactions which we don't want
-                //
-                // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#delta-log-entries
-                // "Delta files are stored as JSON in a directory at the *root* of the table
-                // named _delta_log, and ... make up the log of all changes that have occurred to a table."
-                continue;
-            }
-            if let Some(log_version) = extract_version_from_filename(obj_meta.location.as_ref()) {
-                if min_version == -1 {
-                    min_version = log_version as i64;
-                } else {
-                    min_version = min(min_version, log_version as i64);
-                }
-            }
-            if min_version == 0 {
-                break;
-            }
-        }
-        let latest_default_version = if min_version < 0 {
-            0
-        } else {
-            min_version.try_into().unwrap()
-        };
-        let mut max_version = match self
-            .log_store
-            .get_latest_version(self.version().unwrap_or(latest_default_version))
-            .await
-        {
-            Ok(version) => version,
-            Err(DeltaTableError::InvalidVersion(_)) => {
-                return Err(DeltaTableError::NotATable(
-                    log_store.table_root_url().to_string(),
-                ));
-            }
-            Err(e) => return Err(e),
-        } as i64;
-        let mut version = min_version;
-        let lowest_table_version = min_version;
-        let target_ts = datetime.timestamp_millis();
-
-        // binary search
-        while min_version <= max_version {
-            let pivot = (max_version + min_version) / 2;
-            version = pivot;
-            let pts: i64 = self
-                .get_version_timestamp(pivot.try_into().unwrap())
-                .await?;
-            match pts.cmp(&target_ts) {
-                Ordering::Equal => {
-                    break;
-                }
-                Ordering::Less => {
-                    min_version = pivot + 1;
-                }
-                Ordering::Greater => {
-                    max_version = pivot - 1;
-                    version = max_version
-                }
-            }
-        }
-
-        if version < lowest_table_version {
-            version = lowest_table_version;
-        }
-        assert!(
-            version >= 0,
-            "load_with_datetime() came up with a negative version which shouldn't be possible"
-        );
-
-        self.load_version(version.try_into().unwrap()).await
+        let latest = Snapshot::try_new(self.log_store.as_ref(), None).await?;
+        let version = latest
+            .version_at_timestamp(self.log_store.as_ref(), datetime.timestamp_millis())
+            .await?;
+        self.load_version(version).await
     }
 }
 
@@ -617,6 +518,32 @@ mod tests {
         drop(tmp_dir);
     }
 
+    #[test]
+    fn table_deserializes_legacy_config_slot() {
+        let snapshot: crate::kernel::EagerSnapshot = serde_json::from_str(include_str!(
+            "../../tests/serde/eager_snapshot_pre_identity.json"
+        ))
+        .unwrap();
+        let mut table = DeltaTable::new_in_memory();
+        table.state = Some(DeltaTableState::new(snapshot));
+        let mut value = serde_json::to_value(&table).unwrap();
+        let config = json!({
+            "requireFiles": true,
+            "logBufferSize": 4,
+            "logBatchSize": 1024,
+            "skipStats": false,
+        });
+        value[0]["snapshot"][0]
+            .as_array_mut()
+            .unwrap()
+            .insert(9, config.clone());
+        value.as_array_mut().unwrap().insert(1, config);
+        let actual: DeltaTable = serde_json::from_value(value).unwrap();
+        assert_eq!(actual.version(), Some(1));
+        assert_eq!(actual.snapshot().unwrap().log_data().num_files(), 1);
+        assert_eq!(actual.table_url(), table.table_url());
+    }
+
     #[tokio::test]
     async fn table_without_files_does_not_panic_on_log_data() {
         let (dt, _tmp_dir) = create_test_table().await;
@@ -624,7 +551,6 @@ mod tests {
 
         let table = DeltaTableBuilder::from_url(url)
             .unwrap()
-            .without_files()
             .load()
             .await
             .unwrap();
@@ -634,6 +560,54 @@ mod tests {
         }));
 
         assert!(result.is_ok());
+    }
+
+    /// Copying a table resets the modification times of its log files, so time travel by
+    /// timestamp has to use the in-commit timestamps when the table has them enabled.
+    #[tokio::test]
+    async fn load_with_datetime_uses_in_commit_timestamps() -> DeltaResult<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs_extra::dir::copy(
+            "../test/tests/data/table_with_ict",
+            temp_dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
+        let table_dir = temp_dir.path().join("table_with_ict");
+        let copied_at = std::time::SystemTime::now();
+        let in_commit_timestamps: Vec<i64> = (0..4)
+            .map(|version| {
+                let commit_path = table_dir.join(format!("_delta_log/{version:020}.json"));
+                std::fs::File::options()
+                    .write(true)
+                    .open(&commit_path)
+                    .unwrap()
+                    .set_modified(copied_at)
+                    .unwrap();
+                let commit = std::fs::read_to_string(&commit_path).unwrap();
+                let commit_info: serde_json::Value =
+                    serde_json::from_str(commit.lines().next().unwrap()).unwrap();
+                commit_info["commitInfo"]["inCommitTimestamp"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+        let table_url = Url::from_directory_path(table_dir.canonicalize().unwrap()).unwrap();
+
+        for (version, in_commit_timestamp) in in_commit_timestamps.into_iter().enumerate() {
+            let mut table = DeltaTable::try_from_url(table_url.clone()).await?;
+            table
+                .load_with_datetime(DateTime::from_timestamp_millis(in_commit_timestamp).unwrap())
+                .await?;
+            assert_eq!(table.version(), Some(version as Version));
+            table
+                .load_with_datetime(
+                    DateTime::from_timestamp_millis(in_commit_timestamp - 1).unwrap(),
+                )
+                .await?;
+            assert_eq!(table.version(), Some(version.saturating_sub(1) as Version));
+        }
+        Ok(())
     }
 
     async fn create_test_table() -> (DeltaTable, TempDir) {
